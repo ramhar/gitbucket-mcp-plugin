@@ -52,6 +52,22 @@ object ClientMetadataError {
  */
 object ClientMetadata {
 
+  /**
+   * Permit client metadata documents on loopback addresses.
+   *
+   * Off. With it on, part of the fence below is gone: a client id pointing at
+   * `127.0.0.1` will be fetched, and anything listening there can serve it.
+   * It exists because a developer running an MCP client on the same machine
+   * as GitBucket otherwise cannot complete an authorization at all, and
+   * because the alternative — a test-only branch compiled into the
+   * production path — is worse. Private, link-local, carrier-grade and
+   * multicast ranges stay forbidden either way: this opens loopback only.
+   */
+  val AllowLoopbackProperty = "gitbucket.mcp.oauth.allowLoopbackClients"
+
+  def loopbackAllowed(): Boolean =
+    java.lang.Boolean.parseBoolean(System.getProperty(AllowLoopbackProperty, "false"))
+
   private val ConnectTimeoutMs = 5000
   private val ReadTimeoutMs = 5000
   private val MaxBytes = 64 * 1024
@@ -60,7 +76,9 @@ object ClientMetadata {
   def validateClientId(clientId: String): Either[ClientMetadataError, URI] =
     try {
       val uri = new URI(clientId)
-      if (uri.getScheme == null || uri.getScheme.toLowerCase != "https")
+      if (uri.getScheme == null ||
+          (uri.getScheme.toLowerCase != "https" &&
+           !(loopbackAllowed() && uri.getScheme.toLowerCase == "http" && isLoopbackHost(uri.getHost))))
         Left(ClientMetadataError.Rejected("client_id must be an https URL"))
       else if (uri.getHost == null || uri.getHost.isEmpty)
         Left(ClientMetadataError.Rejected("client_id must name a host"))
@@ -75,7 +93,10 @@ object ClientMetadata {
 
   /** True when this address must never be the target of a server-side fetch. */
   def isForbiddenAddress(addr: InetAddress): Boolean =
-    addr.isLoopbackAddress || addr.isLinkLocalAddress || addr.isSiteLocalAddress ||
+    isForbiddenAddress(addr, allowLoopback = false)
+
+  def isForbiddenAddress(addr: InetAddress, allowLoopback: Boolean): Boolean =
+    (addr.isLoopbackAddress && !allowLoopback) || addr.isLinkLocalAddress || addr.isSiteLocalAddress ||
       addr.isAnyLocalAddress || addr.isMulticastAddress ||
       // 100.64.0.0/10, carrier-grade NAT, not covered by isSiteLocalAddress.
       (addr.getAddress.length == 4 &&
@@ -87,13 +108,14 @@ object ClientMetadata {
 
   val systemResolver: Resolver = InetAddress.getAllByName
 
-  private def checkHost(host: String, resolve: Resolver): Either[ClientMetadataError, Unit] =
+  private def checkHost(host: String, resolve: Resolver,
+                        allowLoopback: Boolean): Either[ClientMetadataError, Unit] =
     try {
       val addresses = resolve(host)
       if (addresses.isEmpty) Left(ClientMetadataError.Unreachable(s"cannot resolve $host"))
       // Every address, not the first: a host that resolves to one public and
       // one private address must not be reachable by retry.
-      else if (addresses.exists(isForbiddenAddress))
+      else if (addresses.exists(isForbiddenAddress(_, allowLoopback)))
         Left(ClientMetadataError.Rejected(s"$host resolves to a non-public address"))
       else Right(())
     } catch {
@@ -108,16 +130,17 @@ object ClientMetadata {
    */
   def fetch(mapper: ObjectMapper, clientId: String,
             open: URL => HttpURLConnection = defaultOpen,
-            resolve: Resolver = systemResolver): Either[ClientMetadataError, OAuthClient] =
+            resolve: Resolver = systemResolver,
+            allowLoopback: Boolean = loopbackAllowed()): Either[ClientMetadataError, OAuthClient] =
     for {
       uri <- validateClientId(clientId)
-      _ <- checkHost(uri.getHost, resolve)
-      body <- read(uri.toURL, open, resolve)
+      _ <- checkHost(uri.getHost, resolve, allowLoopback)
+      body <- read(uri.toURL, open, resolve, allowLoopback)
       client <- parse(mapper, clientId, body)
     } yield client
 
   private def read(url: URL, open: URL => HttpURLConnection,
-                   resolve: Resolver): Either[ClientMetadataError, String] = {
+                   resolve: Resolver, allowLoopback: Boolean): Either[ClientMetadataError, String] = {
     var conn: HttpURLConnection = null
     try {
       conn = open(url)
@@ -135,7 +158,7 @@ object ClientMetadata {
         // The connection is established here, so this is the address actually
         // used rather than the one resolved a moment ago.
         val connected = Option(conn.getURL).map(_.getHost).getOrElse("")
-        checkHost(connected, resolve) match {
+        checkHost(connected, resolve, allowLoopback) match {
           case Left(e) => Left(e)
           case Right(_) => Right(readCapped(conn.getInputStream))
         }
@@ -193,6 +216,9 @@ object ClientMetadata {
     } catch {
       case _: Exception => Left(ClientMetadataError.Malformed("client metadata is not valid JSON"))
     }
+
+  private def isLoopbackHost(host: String): Boolean =
+    host != null && (host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1")
 
   private def defaultOpen(url: URL): HttpURLConnection =
     url.openConnection().asInstanceOf[HttpURLConnection]

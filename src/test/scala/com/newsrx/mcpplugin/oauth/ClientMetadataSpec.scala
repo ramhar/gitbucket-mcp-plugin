@@ -121,6 +121,57 @@ class ClientMetadataSpec extends AnyFunSuite with Matchers {
     result.isLeft shouldBe true
   }
 
+  test("loopback stays forbidden unless the escape is explicitly set") {
+    val loopback = InetAddress.getByName("127.0.0.1")
+    ClientMetadata.isForbiddenAddress(loopback) shouldBe true
+    ClientMetadata.isForbiddenAddress(loopback, allowLoopback = false) shouldBe true
+    ClientMetadata.isForbiddenAddress(loopback, allowLoopback = true) shouldBe false
+  }
+
+  test("the loopback escape opens loopback and nothing else") {
+    // The reason it is narrow: a flag that quietly also admitted 10.0.0.0/8
+    // or 169.254.169.254 would be an SSRF switch rather than a development
+    // convenience.
+    Seq("10.0.0.1", "172.16.0.1", "192.168.1.1", "169.254.169.254",
+        "100.64.0.1", "224.0.0.1").foreach { ip =>
+      withClue(s"$ip with the escape on: ")(
+        ClientMetadata.isForbiddenAddress(InetAddress.getByName(ip), allowLoopback = true) shouldBe true)
+    }
+  }
+
+  test("the escape is off unless the property says otherwise") {
+    val previous = System.getProperty(ClientMetadata.AllowLoopbackProperty)
+    try {
+      System.clearProperty(ClientMetadata.AllowLoopbackProperty)
+      ClientMetadata.loopbackAllowed() shouldBe false
+      System.setProperty(ClientMetadata.AllowLoopbackProperty, "false")
+      ClientMetadata.loopbackAllowed() shouldBe false
+      System.setProperty(ClientMetadata.AllowLoopbackProperty, "yes")
+      ClientMetadata.loopbackAllowed() shouldBe false  // only "true" counts
+      System.setProperty(ClientMetadata.AllowLoopbackProperty, "true")
+      ClientMetadata.loopbackAllowed() shouldBe true
+    } finally {
+      if (previous == null) System.clearProperty(ClientMetadata.AllowLoopbackProperty)
+      else System.setProperty(ClientMetadata.AllowLoopbackProperty, previous)
+    }
+  }
+
+  test("an http client id is only accepted on loopback, and only with the escape") {
+    val previous = System.getProperty(ClientMetadata.AllowLoopbackProperty)
+    try {
+      System.setProperty(ClientMetadata.AllowLoopbackProperty, "true")
+      ClientMetadata.validateClientId("http://localhost:9000/m").isRight shouldBe true
+      ClientMetadata.validateClientId("http://127.0.0.1:9000/m").isRight shouldBe true
+      // Still not any other http host, even with the escape on.
+      ClientMetadata.validateClientId("http://evil.example.com/m").isLeft shouldBe true
+      System.setProperty(ClientMetadata.AllowLoopbackProperty, "false")
+      ClientMetadata.validateClientId("http://localhost:9000/m").isLeft shouldBe true
+    } finally {
+      if (previous == null) System.clearProperty(ClientMetadata.AllowLoopbackProperty)
+      else System.setProperty(ClientMetadata.AllowLoopbackProperty, previous)
+    }
+  }
+
   // ── what a document has to say ────────────────────────────────────────────
 
   test("a well-formed document yields the client's name and redirect URIs") {
