@@ -277,6 +277,10 @@ object OAuthStore {
    * indistinguishable, so the grant is revoked — which is what OAuth 2.1 asks
    * for, and why a well-behaved client must not refresh twice in parallel.
    *
+   * A binding failure is a different thing from a replay and is handled
+   * before any of that: the bindings are checked first, and a presentation
+   * that fails one neither rotates the token nor revokes the grant.
+   *
    * The superseded rows are kept rather than deleted. That is the point: a
    * grant that remembered only its current refresh hash could not tell a
    * replayed old token from a string that was never issued, and would answer
@@ -288,45 +292,55 @@ object OAuthStore {
                          expiresAt: Instant, now: Instant): Either[GrantFailure, (ResolvedGrant, String)] = {
     val presentedHash = Secrets.hash(presented)
 
-    val rotated = using(conn.prepareStatement(
-      "UPDATE MCP_OAUTH_REFRESH SET ROTATED = ? WHERE TOKEN_HASH = ? AND ROTATED = ? AND EXPIRES_AT > ?")) { st =>
-      st.setBoolean(1, true)
-      st.setString(2, presentedHash)
-      st.setBoolean(3, false)
-      st.setTimestamp(4, Timestamp.from(now))
-      st.executeUpdate() == 1
+    // The bindings are checked before anything is written. A refresh token
+    // presented with the wrong client id is a request this server will not
+    // answer, but it is not evidence about the token: anyone can send a
+    // wrong client id, and rotating or revoking on that would let an
+    // unauthenticated caller destroy a credential the legitimate client is
+    // still using. Only a correctly bound presentation moves the chain.
+    val binding = refreshRow(conn, presentedHash) match {
+      case None => Left(GrantFailure.NotFound)
+      case Some((grantId, _)) =>
+        findGrant(conn, grantId) match {
+          case None => Left(GrantFailure.Revoked)
+          case Some(grant) if !Secrets.constantTimeEquals(clientId, grant.clientId) =>
+            Left(GrantFailure.ClientMismatch)
+          case Some(grant) => Right(grant)
+        }
     }
 
-    // One read, not two. Asking for the grant id and then asking whether the
-    // row was rotated leaves a gap in which a concurrent winner can commit
-    // between the two answers, and the loser then classifies a replay as an
-    // expiry. That gap made the concurrency control intermittently
-    // disagree with itself, which is how it was found.
-    val row = refreshRow(conn, presentedHash)
-
-    if (!rotated) {
-      row match {
-        // Present but not rotatable: already used, or expired. A replay ends
-        // the grant; an expiry does not, because it is the client being slow
-        // rather than a credential being somewhere it should not be.
-        case Some((id, true)) =>
-          revokeGrant(conn, id, now)
-          Left(GrantFailure.AlreadyUsed)
-        case Some((_, false)) => Left(GrantFailure.Expired)
-        case None => Left(GrantFailure.NotFound)
+    binding.flatMap { grant =>
+      // The single atomic claim: at most one caller can take this token's
+      // rotation, whatever the scheduling.
+      val rotated = using(conn.prepareStatement(
+        "UPDATE MCP_OAUTH_REFRESH SET ROTATED = ? WHERE TOKEN_HASH = ? AND ROTATED = ? AND EXPIRES_AT > ?")) { st =>
+        st.setBoolean(1, true)
+        st.setString(2, presentedHash)
+        st.setBoolean(3, false)
+        st.setTimestamp(4, Timestamp.from(now))
+        st.executeUpdate() == 1
       }
-    } else {
-      row.map(_._1).flatMap(findGrant(conn, _)) match {
-        case None =>
-          // The row rotated but its grant is gone or revoked.
-          Left(GrantFailure.Revoked)
-        case Some(grant) if !Secrets.constantTimeEquals(clientId, grant.clientId) =>
-          revokeGrant(conn, grant.grantId, now)
-          Left(GrantFailure.ClientMismatch)
-        case Some(grant) =>
-          val replacement = Secrets.newCredential()
-          insertRefresh(conn, Secrets.hash(replacement), grant.grantId, expiresAt, now)
-          Right((grant, replacement))
+
+      if (rotated) {
+        val replacement = Secrets.newCredential()
+        insertRefresh(conn, Secrets.hash(replacement), grant.grantId, expiresAt, now)
+        Right((grant, replacement))
+      } else {
+        // Read after the failed claim, never before: a concurrent winner that
+        // commits between a read and the claim would otherwise make a replay
+        // look like an expiry. That gap made the concurrency control
+        // intermittently disagree with itself, which is how it was found.
+        refreshRow(conn, presentedHash) match {
+          // Present but not rotatable: already used, or expired. A replay
+          // ends the grant; an expiry does not, because it is the client
+          // being slow rather than a credential being somewhere it should
+          // not be.
+          case Some((id, true)) =>
+            revokeGrant(conn, id, now)
+            Left(GrantFailure.AlreadyUsed)
+          case Some((_, false)) => Left(GrantFailure.Expired)
+          case None => Left(GrantFailure.NotFound)
+        }
       }
     }
   }

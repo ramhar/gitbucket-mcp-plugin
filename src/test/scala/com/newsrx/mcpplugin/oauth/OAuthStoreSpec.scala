@@ -325,17 +325,42 @@ class OAuthStoreSpec extends AnyFunSuite with Matchers {
 
   test("a binding failure leaves a lawful refresh token usable") {
     // The distinction the policy depends on: presenting the right token with
-    // the wrong client is a binding failure, which must not be treated as a
-    // replay. Here it does revoke, by design, because an attacker holding a
-    // valid refresh token is the more dangerous reading — but it must not
-    // rotate first, and the wrongly-bound attempt must not hand anything out.
+    // the wrong client is a binding failure, not a replay. It must not
+    // rotate the token, must not revoke the grant and must not hand anything
+    // out — otherwise any caller who learns a refresh token, without even
+    // knowing which client it belongs to, can end the real client's session.
     withDb { conn =>
       val grantId = seedGrant(conn)
       val refresh = OAuthStore.setRefreshToken(conn, grantId, now.plusSeconds(3600), now)
+
       val attempt = OAuthStore.rotateRefreshToken(conn, refresh,
         "https://evil.example.com/meta", now.plusSeconds(3600), now)
       attempt shouldBe Left(GrantFailure.ClientMismatch)
-      attempt.isRight shouldBe false
+
+      // Nothing moved: the grant is alive and the token still rotates once.
+      OAuthStore.findGrant(conn, grantId) should not be empty
+      val lawful = OAuthStore.rotateRefreshToken(conn, refresh, clientId,
+        now.plusSeconds(3600), now)
+      lawful.isRight shouldBe true
+      // And the chain still advanced exactly once.
+      OAuthStore.rotateRefreshToken(conn, refresh, clientId,
+        now.plusSeconds(3600), now) shouldBe Left(GrantFailure.AlreadyUsed)
+    }
+  }
+
+  test("a binding failure on an already rotated token still does not revoke") {
+    withDb { conn =>
+      val grantId = seedGrant(conn)
+      val first = OAuthStore.setRefreshToken(conn, grantId, now.plusSeconds(3600), now)
+      val Right((_, successor)) = OAuthStore.rotateRefreshToken(conn, first, clientId,
+        now.plusSeconds(3600), now)
+
+      OAuthStore.rotateRefreshToken(conn, first, "https://evil.example.com/meta",
+        now.plusSeconds(3600), now) shouldBe Left(GrantFailure.ClientMismatch)
+
+      // The successor the legitimate client holds is untouched.
+      OAuthStore.rotateRefreshToken(conn, successor, clientId,
+        now.plusSeconds(3600), now).isRight shouldBe true
     }
   }
 
@@ -411,16 +436,6 @@ class OAuthStoreSpec extends AnyFunSuite with Matchers {
       OAuthStore.rotateRefreshToken(conn, "never-issued", clientId, now.plusSeconds(3600), now) shouldBe
         Left(GrantFailure.NotFound)
       OAuthStore.findGrant(conn, grantId).isDefined shouldBe true
-    }
-  }
-
-  test("a refresh token presented by another client revokes the grant") {
-    withDb { conn =>
-      val grantId = seedGrant(conn)
-      val refresh = OAuthStore.setRefreshToken(conn, grantId, now.plusSeconds(3600), now)
-      OAuthStore.rotateRefreshToken(conn, refresh, "https://evil.example.com/meta",
-        now.plusSeconds(3600), now) shouldBe Left(GrantFailure.ClientMismatch)
-      OAuthStore.findGrant(conn, grantId) shouldBe None
     }
   }
 
