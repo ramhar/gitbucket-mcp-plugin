@@ -3,10 +3,11 @@ package com.newsrx.mcpplugin.oauth
 import java.sql.{Connection, DriverManager}
 import java.time.Instant
 import java.util.concurrent.{Callable, Executors, TimeUnit}
-import liquibase.{Contexts, LabelExpression, Liquibase}
-import liquibase.database.DatabaseFactory
-import liquibase.database.jvm.JdbcConnection
-import liquibase.resource.ClassLoaderResourceAccessor
+import com.newsrx.mcpplugin.MCPPlugin
+import io.github.gitbucket.solidbase.Solidbase
+import io.github.gitbucket.solidbase.manager.JDBCVersionManager
+import io.github.gitbucket.solidbase.model.{Module => SolidbaseModule}
+import liquibase.database.core.H2Database
 import org.junit.runner.RunWith
 import org.scalatestplus.junit.JUnitRunner
 import org.scalatest.funsuite.AnyFunSuite
@@ -16,11 +17,13 @@ import scala.jdk.CollectionConverters._
 /**
  * The grant store, against a real database, with the real schema.
  *
- * H2 in memory, created by applying the plugin's own Liquibase changelog —
- * so the migration is exercised by every case here rather than being a file
- * nobody runs until deployment. The same changelog is what runs on
- * PostgreSQL; this suite establishes the logic, not the PostgreSQL DDL, and
- * that distinction is kept in the documentation.
+ * H2 in memory, created by running the plugin's own declared versions
+ * through Solidbase — the same mechanism GitBucket uses at startup, reading
+ * the same `versions` list the plugin publishes. Applying the changelog
+ * directly through Liquibase would be a different code path, and a file that
+ * Liquibase accepts can still be one Solidbase silently skips. The same
+ * versions are what run on PostgreSQL; this suite establishes the logic, not
+ * the PostgreSQL DDL, and that distinction is kept in the documentation.
  *
  * The concurrency cases use two real connections and a thread pool. A
  * sequential test cannot tell an atomic conditional update from a
@@ -40,21 +43,31 @@ class OAuthStoreSpec extends AnyFunSuite with Matchers {
 
   private var counter = 0
 
+  /** The plugin's own module definition, as GitBucket builds it. */
+  private def pluginModule(): SolidbaseModule =
+    new SolidbaseModule("mcp-plugin", new MCPPlugin().versions.toArray: _*)
+
+  /** Run the plugin's declared versions the way GitBucket's startup does. */
+  private def migrate(conn: Connection): Unit = {
+    val wasAuto = conn.getAutoCommit
+    conn.setAutoCommit(false)
+    try {
+      new Solidbase().migrate(conn, getClass.getClassLoader, new H2Database(), pluginModule())
+      conn.commit()
+    } finally conn.setAutoCommit(wasAuto)
+  }
+
+  /** The schema version Solidbase recorded for the plugin. */
+  private def recordedVersion(conn: Connection): String =
+    new JDBCVersionManager(conn).getCurrentVersion("mcp-plugin")
+
   /** A fresh, independently named in-memory database per test. */
   private def freshDb(): String = {
     counter += 1
     val name = s"mcpoauth$counter"
     val url = s"jdbc:h2:mem:$name;DB_CLOSE_DELAY=-1"
     val conn = DriverManager.getConnection(url)
-    try {
-      val database = DatabaseFactory.getInstance
-        .findCorrectDatabaseImplementation(new JdbcConnection(conn))
-      // `liquibase` as a local name would shadow the package, so the types
-      // below could not be resolved.
-      val lb = new Liquibase("update/mcp-plugin_1.0.xml",
-        new ClassLoaderResourceAccessor(), database)
-      lb.update(new Contexts(), new LabelExpression())
-    } finally conn.close()
+    try migrate(conn) finally conn.close()
     url
   }
 
@@ -83,16 +96,21 @@ class OAuthStoreSpec extends AnyFunSuite with Matchers {
     }
   }
 
-  test("the changelog is idempotent, as an upgrade path requires") {
+  test("Solidbase records the last declared version, so GitBucket's own check passes") {
+    withDb { conn =>
+      // GitBucket throws IllegalStateException at startup unless the recorded
+      // version equals `versions.last`. A changelog Solidbase cannot parse
+      // leaves an earlier version recorded, and the tables never appear.
+      recordedVersion(conn) shouldBe new MCPPlugin().versions.last.getVersion
+    }
+  }
+
+  test("re-running the declared versions is a no-op, as a restart requires") {
     val url = freshDb()
     val conn = DriverManager.getConnection(url)
     try {
-      val database = DatabaseFactory.getInstance
-        .findCorrectDatabaseImplementation(new JdbcConnection(conn))
-      // Running it a second time must not fail or duplicate anything.
-      noException should be thrownBy new Liquibase("update/mcp-plugin_1.0.xml",
-        new ClassLoaderResourceAccessor(), database)
-        .update(new Contexts(), new LabelExpression())
+      noException should be thrownBy migrate(conn)
+      recordedVersion(conn) shouldBe new MCPPlugin().versions.last.getVersion
       OAuthStore.grantsFor(conn, "alice") shouldBe empty
     } finally conn.close()
   }
@@ -251,6 +269,14 @@ class OAuthStoreSpec extends AnyFunSuite with Matchers {
       }
     } finally check.close()
   }
+
+  // ── the two schedules, deterministically ──────────────────────────────────
+  //
+  // The overlapping test above cannot choose its interleaving, so it asserts
+  // only what holds under every schedule. These two pin down the specific
+  // orderings the policy has to get right, as ordinary sequences with no
+  // threads: what the database did, what replay handling did, and what a
+  // later authorization check sees are three separate questions.
 
   test("schedule A: replay after the first exchange has completed") {
     withDb { conn =>
