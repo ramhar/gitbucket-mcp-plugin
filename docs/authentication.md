@@ -126,6 +126,18 @@ matters when a grant is withdrawn or an account is disabled.
 | access token | 1 hour | immediate |
 | refresh token | 30 days, rotated on use | immediate; reuse of a rotated token revokes the whole grant |
 
+Reuse detection applies to races as well as to theft, because the server
+cannot tell them apart. If a client presents the same refresh token twice at
+once, one request rotates it and the other sees a token that has already been
+rotated — which is exactly what a stolen copy looks like — so the grant is
+revoked and **neither** request comes away with a usable credential. A client
+must therefore serialise its refreshes. This is what OAuth 2.1 asks for, and
+it is tested against two real connections rather than assumed.
+
+Expiry is treated differently on purpose. An expired refresh token is refused
+but does **not** revoke the grant: that is the client being slow, not a
+credential being somewhere it should not be.
+
 ## Scopes
 
 | Scope | Grants |

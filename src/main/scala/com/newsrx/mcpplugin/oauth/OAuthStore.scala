@@ -297,21 +297,26 @@ object OAuthStore {
       st.executeUpdate() == 1
     }
 
-    val grantId = refreshGrantId(conn, presentedHash)
+    // One read, not two. Asking for the grant id and then asking whether the
+    // row was rotated leaves a gap in which a concurrent winner can commit
+    // between the two answers, and the loser then classifies a replay as an
+    // expiry. That gap made the concurrency control intermittently
+    // disagree with itself, which is how it was found.
+    val row = refreshRow(conn, presentedHash)
 
     if (!rotated) {
-      grantId match {
+      row match {
         // Present but not rotatable: already used, or expired. A replay ends
         // the grant; an expiry does not, because it is the client being slow
         // rather than a credential being somewhere it should not be.
-        case Some(id) if isRotated(conn, presentedHash) =>
+        case Some((id, true)) =>
           revokeGrant(conn, id, now)
           Left(GrantFailure.AlreadyUsed)
-        case Some(_) => Left(GrantFailure.Expired)
+        case Some((_, false)) => Left(GrantFailure.Expired)
         case None => Left(GrantFailure.NotFound)
       }
     } else {
-      grantId.flatMap(findGrant(conn, _)) match {
+      row.map(_._1).flatMap(findGrant(conn, _)) match {
         case None =>
           // The row rotated but its grant is gone or revoked.
           Left(GrantFailure.Revoked)
@@ -326,17 +331,15 @@ object OAuthStore {
     }
   }
 
-  private def refreshGrantId(conn: Connection, hash: String): Option[String] =
-    using(conn.prepareStatement("SELECT GRANT_ID FROM MCP_OAUTH_REFRESH WHERE TOKEN_HASH = ?")) { st =>
+  /** The grant a refresh token belongs to, and whether it has been rotated. */
+  private def refreshRow(conn: Connection, hash: String): Option[(String, Boolean)] =
+    using(conn.prepareStatement("SELECT GRANT_ID, ROTATED FROM MCP_OAUTH_REFRESH WHERE TOKEN_HASH = ?")) { st =>
       st.setString(1, hash)
-      using(st.executeQuery())(rs => if (rs.next()) Some(rs.getString(1)) else None)
+      using(st.executeQuery())(rs => if (rs.next()) Some((rs.getString(1), rs.getBoolean(2))) else None)
     }
 
-  private def isRotated(conn: Connection, hash: String): Boolean =
-    using(conn.prepareStatement("SELECT ROTATED FROM MCP_OAUTH_REFRESH WHERE TOKEN_HASH = ?")) { st =>
-      st.setString(1, hash)
-      using(st.executeQuery())(rs => rs.next() && rs.getBoolean(1))
-    }
+  private def refreshGrantId(conn: Connection, hash: String): Option[String] =
+    refreshRow(conn, hash).map(_._1)
 
   /** RFC 7009: revoke by either credential type; both end the grant. */
   def revokeByToken(conn: Connection, token: String, now: Instant): Boolean = {

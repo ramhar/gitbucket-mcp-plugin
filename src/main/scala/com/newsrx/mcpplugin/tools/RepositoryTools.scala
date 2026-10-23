@@ -2,6 +2,7 @@ package com.newsrx.mcpplugin.tools
 
 import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
 import com.fasterxml.jackson.databind.node.ObjectNode
+import com.newsrx.mcpplugin.oauth.McpScope
 import com.newsrx.mcpplugin.mcp.ToolDef
 import gitbucket.core.model.Account
 import gitbucket.core.service.{AccountService, RepositoryService}
@@ -17,6 +18,7 @@ private[tools] trait RepoService
 
 class ListRepositoriesTool extends ToolDef with RepoService {
   val name        = "list_repositories"
+  val requiredScope = McpScope.Read
   val description = "List repositories accessible to a GitBucket user"
 
   def inputSchema(mapper: ObjectMapper) = objectSchema(
@@ -63,6 +65,7 @@ class ListRepositoriesTool extends ToolDef with RepoService {
 
 class GetRepositoryTool extends ToolDef with RepoService {
   val name        = "get_repository"
+  val requiredScope = McpScope.Read
   val description = "Get details of a specific GitBucket repository"
 
   def inputSchema(mapper: ObjectMapper) = objectSchema(

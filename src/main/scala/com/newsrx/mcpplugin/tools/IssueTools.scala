@@ -2,6 +2,7 @@ package com.newsrx.mcpplugin.tools
 
 import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
 import com.fasterxml.jackson.databind.node.ObjectNode
+import com.newsrx.mcpplugin.oauth.McpScope
 import com.newsrx.mcpplugin.mcp.{StrictArgs, Timestamps, ToolDef}
 import gitbucket.core.model.{Account, Issue}
 import gitbucket.core.service.{AccountService, IssuesService, LabelsService, MilestonesService, PrioritiesService, RepositoryService}
@@ -39,6 +40,7 @@ private[tools] object IssueJson {
 
 class ListIssuesTool extends ToolDef with IssueService {
   val name        = "list_issues"
+  val requiredScope = McpScope.Read
   val description = "List issues in a GitBucket repository (excludes pull requests)"
 
   def inputSchema(mapper: ObjectMapper) = objectSchema(
@@ -83,6 +85,7 @@ class ListIssuesTool extends ToolDef with IssueService {
 
 class GetIssueTool extends ToolDef with IssueService {
   val name        = "get_issue"
+  val requiredScope = McpScope.Read
   val description = "Get details of a specific issue"
 
   def inputSchema(mapper: ObjectMapper) = objectSchema(
@@ -116,6 +119,7 @@ class GetIssueTool extends ToolDef with IssueService {
 
 class CreateIssueTool extends ToolDef with IssueService {
   val name        = "create_issue"
+  val requiredScope = McpScope.Write
   val description = "Create a new issue in a GitBucket repository"
 
   def inputSchema(mapper: ObjectMapper) = objectSchema(
@@ -161,6 +165,7 @@ class CreateIssueTool extends ToolDef with IssueService {
 
 class CloseIssueTool extends ToolDef with IssueService {
   val name        = "close_issue"
+  val requiredScope = McpScope.Write
   val description = "Close an issue"
 
   def inputSchema(mapper: ObjectMapper) = objectSchema(
@@ -196,6 +201,7 @@ class CloseIssueTool extends ToolDef with IssueService {
 
 class ReopenIssueTool extends ToolDef with IssueService {
   val name        = "reopen_issue"
+  val requiredScope = McpScope.Write
   val description = "Reopen a closed issue"
 
   def inputSchema(mapper: ObjectMapper) = objectSchema(
@@ -229,6 +235,7 @@ class ReopenIssueTool extends ToolDef with IssueService {
 
 class AddIssueCommentTool extends ToolDef with IssueService {
   val name        = "add_issue_comment"
+  val requiredScope = McpScope.Write
   val description = "Add a comment to an issue"
 
   def inputSchema(mapper: ObjectMapper) = objectSchema(
@@ -279,6 +286,7 @@ class AddIssueCommentTool extends ToolDef with IssueService {
  */
 class UpdateOwnCommentTool extends ToolDef with IssueService {
   val name        = "update_own_comment"
+  val requiredScope = McpScope.Write
   val description = "Edit a comment written by the authenticated account, with exact read-back of the stored text"
 
   def inputSchema(mapper: ObjectMapper) = objectSchema(

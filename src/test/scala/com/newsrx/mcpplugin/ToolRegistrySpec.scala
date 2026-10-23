@@ -1,6 +1,7 @@
 package com.newsrx.mcpplugin
 
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.newsrx.mcpplugin.oauth.McpScope
 import com.newsrx.mcpplugin.mcp.ToolRegistry
 import org.junit.runner.RunWith
 import org.scalatestplus.junit.JUnitRunner
@@ -109,5 +110,47 @@ class ToolRegistrySpec extends AnyFunSuite with Matchers {
     // the descriptor is missing from the test classpath or left empty.
     PluginDescriptor.get("pluginVersion").trim should not be empty
     PluginDescriptor.get("pluginId") shouldBe "mcp-plugin"
+  }
+
+  // ── scope policy ──────────────────────────────────────────────────────────
+
+  test("every registered tool declares the scope it requires") {
+    // The member is abstract, so this cannot fail at runtime — it is here to
+    // state the invariant the compiler is enforcing, and to fail loudly if a
+    // default is ever introduced.
+    ToolRegistry.all(mapper).foreach { t =>
+      withClue(s"${t.name}: ")(Seq(McpScope.Read, McpScope.Write) should contain(t.requiredScope))
+    }
+  }
+
+  test("the read and write split is exactly the published one") {
+    val byScope = ToolRegistry.all(mapper).groupBy(_.requiredScope).map {
+      case (k, v) => k -> v.map(_.name).toSet
+    }
+    byScope(McpScope.Read) shouldBe Set("whoami", "list_repositories", "get_repository",
+      "list_issues", "get_issue", "list_pull_requests", "get_pull_request", "get_pr_diff",
+      "get_thread_comments")
+    byScope(McpScope.Write) shouldBe Set("create_issue", "close_issue", "reopen_issue",
+      "add_issue_comment", "update_own_comment", "add_pr_comment", "close_pull_request",
+      "reopen_pull_request", "update_pull_request", "mark_ready_for_review")
+  }
+
+  test("no tool whose name reads as a mutation is classified read-only") {
+    // A cheap independent check on the table above: if someone adds
+    // `delete_issue` and marks it Read, this notices without the list being
+    // updated.
+    val mutating = Seq("create", "close", "reopen", "update", "add", "delete", "merge", "mark")
+    ToolRegistry.all(mapper)
+      .filter(t => mutating.exists(t.name.startsWith))
+      .foreach(t => withClue(s"${t.name}: ")(t.requiredScope shouldBe McpScope.Write))
+  }
+
+  test("a write grant satisfies every tool; a read grant satisfies only the read tools") {
+    val read = Set("mcp:read")
+    val write = Set("mcp:write")
+    val all = ToolRegistry.all(mapper)
+    all.count(_.requiredScope.satisfiedBy(write)) shouldBe all.size
+    all.count(_.requiredScope.satisfiedBy(read)) shouldBe 9
+    all.count(_.requiredScope.satisfiedBy(Set.empty[String])) shouldBe 0
   }
 }

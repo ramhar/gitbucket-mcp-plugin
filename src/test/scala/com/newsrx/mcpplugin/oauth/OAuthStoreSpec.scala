@@ -205,16 +205,25 @@ class OAuthStoreSpec extends AnyFunSuite with Matchers {
     } finally pool.shutdownNow()
   }
 
-  test("two simultaneous refreshes produce exactly one new token") {
+  test("two simultaneous refreshes rotate exactly once and end the grant") {
+    // What the race actually produces, rather than what is convenient to
+    // assert. The rotation itself is atomic, so exactly one UPDATE matches.
+    // But the loser sees an already-rotated token, which is indistinguishable
+    // from a stolen copy being replayed, so it revokes the family — and the
+    // winner, reaching its grant a moment later, finds it revoked too.
+    //
+    // Neither caller gets a usable credential, which is the documented
+    // reuse-detection policy applied consistently. A client must not refresh
+    // twice in parallel; OAuth 2.1 says so for exactly this reason.
     val url = freshDb()
     val setup = DriverManager.getConnection(url)
-    val refresh = try {
-      val grantId = seedGrant(setup)
-      OAuthStore.setRefreshToken(setup, grantId, now.plusSeconds(3600), now)
+    val (grantId, refresh) = try {
+      val g = seedGrant(setup)
+      (g, OAuthStore.setRefreshToken(setup, g, now.plusSeconds(3600), now))
     } finally setup.close()
 
     val pool = Executors.newFixedThreadPool(2)
-    try {
+    val results = try {
       val task = new Callable[Either[GrantFailure, (ResolvedGrant, String)]] {
         def call(): Either[GrantFailure, (ResolvedGrant, String)] = {
           val c = DriverManager.getConnection(url)
@@ -222,13 +231,61 @@ class OAuthStoreSpec extends AnyFunSuite with Matchers {
           finally c.close()
         }
       }
-      val results = pool.invokeAll(List(task, task).asJava, 30, TimeUnit.SECONDS)
-        .asScala.map(_.get()).toList
-      withClue(s"results=$results: ") {
-        results.count(_.isRight) shouldBe 1
-        results.count(_ == Left(GrantFailure.AlreadyUsed)) shouldBe 1
-      }
+      pool.invokeAll(List(task, task).asJava, 30, TimeUnit.SECONDS).asScala.map(_.get()).toList
     } finally pool.shutdownNow()
+
+    val check = DriverManager.getConnection(url)
+    try {
+      withClue(s"results=$results: ") {
+        // The atomic step ran once: one caller saw the token as still
+        // rotatable, the other saw it already rotated.
+        results.count(_ == Left(GrantFailure.AlreadyUsed)) shouldBe 1
+        // At most one succeeded, and the grant is gone either way.
+        results.count(_.isRight) should be <= 1
+        OAuthStore.findGrant(check, grantId) shouldBe None
+        // Nothing either caller came away with is usable.
+        results.collect { case Right((_, token)) => token }.foreach { token =>
+          OAuthStore.rotateRefreshToken(check, token, clientId, now.plusSeconds(3600), now)
+            .isRight shouldBe false
+        }
+      }
+    } finally check.close()
+  }
+
+  test("exactly one successor row exists after a contended rotation") {
+    // The storage-level invariant on its own: whatever the callers were told,
+    // the chain did not fork.
+    val url = freshDb()
+    val setup = DriverManager.getConnection(url)
+    val refresh = try {
+      OAuthStore.setRefreshToken(setup, seedGrant(setup), now.plusSeconds(3600), now)
+    } finally setup.close()
+
+    val pool = Executors.newFixedThreadPool(2)
+    try {
+      val task = new Callable[Any] {
+        def call(): Any = {
+          val c = DriverManager.getConnection(url)
+          try OAuthStore.rotateRefreshToken(c, refresh, clientId, now.plusSeconds(3600), now)
+          finally c.close()
+        }
+      }
+      pool.invokeAll(List(task, task).asJava, 30, TimeUnit.SECONDS).asScala.foreach(_.get())
+    } finally pool.shutdownNow()
+
+    val check = DriverManager.getConnection(url)
+    try {
+      val st = check.createStatement()
+      try {
+        val rs = st.executeQuery("SELECT COUNT(*) FROM MCP_OAUTH_REFRESH")
+        rs.next()
+        // The original plus at most one successor; never two successors.
+        rs.getInt(1) should be <= 2
+        val rotated = st.executeQuery("SELECT COUNT(*) FROM MCP_OAUTH_REFRESH WHERE ROTATED = TRUE")
+        rotated.next()
+        rotated.getInt(1) shouldBe 1
+      } finally st.close()
+    } finally check.close()
   }
 
   // ── refresh rotation ──────────────────────────────────────────────────────

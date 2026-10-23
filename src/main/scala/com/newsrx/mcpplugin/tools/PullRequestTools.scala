@@ -2,6 +2,7 @@ package com.newsrx.mcpplugin.tools
 
 import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
 import com.fasterxml.jackson.databind.node.ObjectNode
+import com.newsrx.mcpplugin.oauth.McpScope
 import com.newsrx.mcpplugin.mcp.{StrictArgs, Timestamps, ToolDef}
 import gitbucket.core.model.{Account, Issue, IssueComment, PullRequest}
 import gitbucket.core.service.{AccountService, ActivityService, CommitsService, IssuesService, LabelsService, MergeService, MilestonesService, PrioritiesService, PullRequestService, RepositoryService, RequestCache, SystemSettingsService, WebHookPullRequestReviewCommentService, WebHookPullRequestService, WebHookService}
@@ -111,6 +112,7 @@ private[tools] object PrJson {
 
 class ListPullRequestsTool extends ToolDef with PrService {
   val name        = "list_pull_requests"
+  val requiredScope = McpScope.Read
   val description = "List pull requests in a GitBucket repository"
 
   def inputSchema(mapper: ObjectMapper) = objectSchema(
@@ -156,6 +158,7 @@ class ListPullRequestsTool extends ToolDef with PrService {
 
 class GetPullRequestTool extends ToolDef with PrService {
   val name        = "get_pull_request"
+  val requiredScope = McpScope.Read
   val description = "Get details of a specific pull request"
 
   def inputSchema(mapper: ObjectMapper) = objectSchema(
@@ -189,6 +192,7 @@ class GetPullRequestTool extends ToolDef with PrService {
 
 class AddPrCommentTool extends ToolDef with PrService {
   val name        = "add_pr_comment"
+  val requiredScope = McpScope.Write
   val description = "Add a comment to a pull request"
 
   def inputSchema(mapper: ObjectMapper) = objectSchema(
@@ -228,6 +232,7 @@ class AddPrCommentTool extends ToolDef with PrService {
 
 class ClosePullRequestTool extends ToolDef with PrService {
   val name        = "close_pull_request"
+  val requiredScope = McpScope.Write
   val description = "Close a pull request without merging"
 
   def inputSchema(mapper: ObjectMapper) = objectSchema(
@@ -263,6 +268,7 @@ class ClosePullRequestTool extends ToolDef with PrService {
 
 class ReopenPullRequestTool extends ToolDef with PrService {
   val name        = "reopen_pull_request"
+  val requiredScope = McpScope.Write
   val description = "Reopen a closed pull request"
 
   def inputSchema(mapper: ObjectMapper) = objectSchema(
@@ -296,6 +302,7 @@ class ReopenPullRequestTool extends ToolDef with PrService {
 
 class GetPrDiffTool extends ToolDef with PrService {
   val name        = "get_pr_diff"
+  val requiredScope = McpScope.Read
   val description = "Get the list of files changed in a pull request"
 
   def inputSchema(mapper: ObjectMapper) = objectSchema(
@@ -355,6 +362,7 @@ class GetPrDiffTool extends ToolDef with PrService {
  */
 class GetThreadCommentsTool extends ToolDef with PrService {
   val name        = "get_thread_comments"
+  val requiredScope = McpScope.Read
   val description = "Read the comments of an issue or pull request thread, with ids, authors and bounded pagination"
 
   val MaxLimit = 50
@@ -427,6 +435,7 @@ class GetThreadCommentsTool extends ToolDef with PrService {
  */
 class UpdatePullRequestTool extends ToolDef with PrService {
   val name        = "update_pull_request"
+  val requiredScope = McpScope.Write
   val description = "Update the title and/or body of a pull request, preserving the field that is not supplied"
 
   def inputSchema(mapper: ObjectMapper) = objectSchema(
@@ -519,6 +528,7 @@ class UpdatePullRequestTool extends ToolDef with PrService {
  */
 class MarkReadyForReviewTool extends ToolDef with PrService {
   val name        = "mark_ready_for_review"
+  val requiredScope = McpScope.Write
   val description = "Take an open, unmerged draft pull request out of draft using GitBucket's native operation"
 
   def inputSchema(mapper: ObjectMapper) = objectSchema(

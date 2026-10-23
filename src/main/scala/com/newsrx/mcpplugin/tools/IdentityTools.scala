@@ -3,6 +3,7 @@ package com.newsrx.mcpplugin.tools
 import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
 import com.fasterxml.jackson.databind.node.ObjectNode
 import com.newsrx.mcpplugin.PluginDescriptor
+import com.newsrx.mcpplugin.oauth.McpScope
 import com.newsrx.mcpplugin.mcp.ToolDef
 import gitbucket.core.model.Account
 import javax.servlet.http.HttpServletRequest
@@ -21,6 +22,7 @@ import javax.servlet.http.HttpServletRequest
  */
 class WhoAmITool extends ToolDef {
   val name = "whoami"
+  val requiredScope = McpScope.Read
   val description =
     "Return the GitBucket account this MCP connection is authenticated as, plus the self-reported plugin descriptor"
 
