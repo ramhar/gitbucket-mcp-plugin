@@ -2,7 +2,7 @@ package com.newsrx.mcpplugin
 
 import com.fasterxml.jackson.databind.node.ObjectNode
 import com.newsrx.mcpplugin.mcp.{JsonRpc, ToolRegistry}
-import com.newsrx.mcpplugin.tools.SessionSupport
+import com.newsrx.mcpplugin.tools.{AuthorizationError, SessionSupport}
 import gitbucket.core.controller.ControllerBase
 import gitbucket.core.model.Account
 import gitbucket.core.service.{AccountService, RepositoryService, SystemSettingsService}
@@ -123,6 +123,11 @@ class MCPController
           val result = tool.execute(args, account, request, mapper)
           JsonRpc.successResponse(mapper, req.id, result)
         } catch {
+          // A denial is its own outcome, not an internal failure: reporting it
+          // as InternalError would tell a caller the server broke when in fact
+          // the server refused.
+          case e: AuthorizationError =>
+            JsonRpc.errorResponse(mapper, req.id, JsonRpc.McpError - 2, e.getMessage)
           case e: NoSuchElementException =>
             JsonRpc.errorResponse(mapper, req.id, JsonRpc.McpError - 1, e.getMessage)
           case e: IllegalArgumentException =>
@@ -157,7 +162,9 @@ class MCPController
 
     val serverInfo = mapper.createObjectNode()
     serverInfo.put("name",    "gitbucket-mcp-plugin")
-    serverInfo.put("version", "0.1.0")
+    // Reported from the descriptor that ships in the JAR instead of a second
+    // hardcoded literal: the two disagreed in v0.1.1.
+    serverInfo.put("version", PluginDescriptor.get("pluginVersion"))
 
     root.set[ObjectNode]("capabilities", capabilities)
     root.set[ObjectNode]("serverInfo",   serverInfo)

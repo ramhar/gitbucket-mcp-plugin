@@ -11,6 +11,7 @@ private[tools] trait RepoService
     extends RepositoryService
     with AccountService
     with SessionSupport
+    with RepositoryAuthorization
 
 // ── list_repositories ───────────────────────────────────────────────────────
 
@@ -31,7 +32,11 @@ class ListRepositoriesTool extends ToolDef with RepoService {
 
     implicit val session = blockingSession(request)
 
-    val repos = getUserRepositories(owner, withoutForked)
+    // `getUserRepositories` answers for `owner`, not for the caller: without
+    // this filter the listing hands every private repository of any account to
+    // anyone who can authenticate. Each entry is kept only if the caller may
+    // read it under GitBucket's own rule.
+    val repos = getUserRepositories(owner, withoutForked).filter(canRead(_, account))
     val arr   = mapper.createArrayNode()
     repos.foreach { info =>
       val r = info.repository
@@ -73,10 +78,8 @@ class GetRepositoryTool extends ToolDef with RepoService {
 
     implicit val session = blockingSession(request)
 
-    getRepository(owner, repo) match {
-      case None =>
-        throw new NoSuchElementException(s"repository $owner/$repo not found")
-      case Some(info) =>
+    readableRepository(owner, repo, account) match {
+      case info =>
         val r = info.repository
         val n = mapper.createObjectNode()
         n.put("name",           r.repositoryName)

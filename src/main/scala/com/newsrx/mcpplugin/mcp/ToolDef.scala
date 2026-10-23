@@ -131,6 +131,9 @@ object ToolRegistry {
       new ClosePullRequestTool,
       new ReopenPullRequestTool,
       new GetPrDiffTool,
+      new GetThreadCommentsTool,
+      new UpdatePullRequestTool,
+      new MarkReadyForReviewTool,
       // Issue tools
       new ListIssuesTool,
       new GetIssueTool,
@@ -138,9 +141,12 @@ object ToolRegistry {
       new CloseIssueTool,
       new ReopenIssueTool,
       new AddIssueCommentTool,
+      new UpdateOwnCommentTool,
       // Repository tools
       new ListRepositoriesTool,
-      new GetRepositoryTool
+      new GetRepositoryTool,
+      // Identity
+      new WhoAmITool
     )
   }
 
