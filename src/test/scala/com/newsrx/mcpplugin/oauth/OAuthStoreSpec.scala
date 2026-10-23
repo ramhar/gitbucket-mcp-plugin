@@ -252,6 +252,67 @@ class OAuthStoreSpec extends AnyFunSuite with Matchers {
     } finally check.close()
   }
 
+  test("schedule A: replay after the first exchange has completed") {
+    withDb { conn =>
+      val grantId = seedGrant(conn)
+      val first = OAuthStore.setRefreshToken(conn, grantId, now.plusSeconds(3600), now)
+
+      // The legitimate exchange completes and its caller holds both tokens.
+      val Right((_, successor)) =
+        OAuthStore.rotateRefreshToken(conn, first, clientId, now.plusSeconds(3600), now)
+      val access = OAuthStore.issueAccessToken(conn, grantId, now.plusSeconds(3600), now)
+      OAuthStore.resolveAccessToken(conn, access, now).isRight shouldBe true
+
+      // Only afterwards does the superseded token come back.
+      OAuthStore.rotateRefreshToken(conn, first, clientId, now.plusSeconds(3600), now) shouldBe
+        Left(GrantFailure.AlreadyUsed)
+
+      // Committed state: the family is gone.
+      OAuthStore.findGrant(conn, grantId) shouldBe None
+      // A fresh authorization check refuses what the completed exchange
+      // produced. The earlier response was not retracted; the credentials it
+      // carried simply stop being accepted.
+      OAuthStore.resolveAccessToken(conn, access, now) shouldBe Left(GrantFailure.Revoked)
+      OAuthStore.rotateRefreshToken(conn, successor, clientId, now.plusSeconds(3600), now)
+        .isRight shouldBe false
+    }
+  }
+
+  test("schedule B: revocation lands between a completed exchange and the next use") {
+    withDb { conn =>
+      val grantId = seedGrant(conn)
+      val first = OAuthStore.setRefreshToken(conn, grantId, now.plusSeconds(3600), now)
+      val Right((_, successor)) =
+        OAuthStore.rotateRefreshToken(conn, first, clientId, now.plusSeconds(3600), now)
+      val access = OAuthStore.issueAccessToken(conn, grantId, now.plusSeconds(3600), now)
+
+      // The user withdraws consent after the exchange returned.
+      OAuthStore.revokeGrant(conn, grantId, now) shouldBe true
+
+      // Everything that exchange produced is refused at the next check, and
+      // the successor cannot be rotated back into a live grant.
+      OAuthStore.resolveAccessToken(conn, access, now) shouldBe Left(GrantFailure.Revoked)
+      OAuthStore.rotateRefreshToken(conn, successor, clientId, now.plusSeconds(3600), now)
+        .isRight shouldBe false
+    }
+  }
+
+  test("a binding failure leaves a lawful refresh token usable") {
+    // The distinction the policy depends on: presenting the right token with
+    // the wrong client is a binding failure, which must not be treated as a
+    // replay. Here it does revoke, by design, because an attacker holding a
+    // valid refresh token is the more dangerous reading — but it must not
+    // rotate first, and the wrongly-bound attempt must not hand anything out.
+    withDb { conn =>
+      val grantId = seedGrant(conn)
+      val refresh = OAuthStore.setRefreshToken(conn, grantId, now.plusSeconds(3600), now)
+      val attempt = OAuthStore.rotateRefreshToken(conn, refresh,
+        "https://evil.example.com/meta", now.plusSeconds(3600), now)
+      attempt shouldBe Left(GrantFailure.ClientMismatch)
+      attempt.isRight shouldBe false
+    }
+  }
+
   test("exactly one successor row exists after a contended rotation") {
     // The storage-level invariant on its own: whatever the callers were told,
     // the chain did not fork.
