@@ -11,24 +11,34 @@ have.
 
 ## Why the plugin is also the authorization server
 
-GitBucket 4.46–4.48 is **not** an OAuth authorization server. It ships
+GitBucket is **not** an OAuth authorization server. It ships
 `AccessToken`/`AccessTokenService` — personal access tokens, stored as a hash —
 and session authenticators, but no authorization endpoint, no token endpoint,
 no client registry and no key set. Its OAuth support is as a *client*, for
 signing users in from an external provider. Verified against the published
-4.48.0 artifact rather than assumed.
+artifacts rather than assumed.
 
 So an authorization server has to come from somewhere, and there are two
 honest options.
 
 **An external authorization server** (Keycloak, Authentik, a hosted IdP). This
-is a second service to deploy, operate and back up, with its own user store.
-Worse, it reintroduces the problem this plugin exists to avoid: the external
-server's subject is not a GitBucket account, so something has to map one to
-the other, and the only cheap mapping — matching an email address — is exactly
-the unverified link that turns an identity provider into a privilege
-escalation. Rejected, but recorded here so the choice is visible rather than
-implied.
+can be done safely: the mapping from the external subject to a GitBucket
+account is an explicit, administrator-established binding on
+`(issuer, subject)`, stored and verified, and an identity provider that
+GitBucket already trusts for sign-in is a reasonable thing to trust for
+authorization too. Matching on email is not the only option and is not what
+makes this approach hard.
+
+What makes it hard is operational. It is a second service to deploy, operate,
+upgrade and back up; it needs its own availability story, because the MCP
+endpoint stops authenticating when it is down; and the binding table has to be
+populated and maintained by hand for every user, which is work an
+administrator does before anyone can connect. For a plugin whose premise is
+"no separate service or proxy required", that cost falls on every deployment
+to serve a case most of them do not have. Rejected on those grounds, and
+recorded here so the choice is visible rather than implied. A deployment that
+already runs an IdP and wants it to own MCP authorization is a reasonable
+future option, not a contradiction of this one.
 
 **The plugin acts as the authorization server**, authenticating the resource
 owner with the GitBucket session the user already has. No new identity store,
@@ -39,6 +49,30 @@ to be signed in to GitBucket. Chosen.
 The cost of that choice is honest too: this plugin then owns authorization
 codes, tokens and consent records, and owns their security properties. The
 rest of this document is about those properties.
+
+## What is a dependency and what is ours
+
+The protocol types come from **`com.nimbusds:oauth2-oidc-sdk`**, Apache-2.0,
+which GitBucket already carries on its runtime classpath for its own OpenID
+Connect sign-in. It is therefore a `compileOnly` dependency and is **not**
+bundled into the plugin JAR: no duplicate classes, no version skew with the
+host, no growth in the artifact. Pinned at 11.33, the version shipped by the
+oldest supported GitBucket, so only API present across the whole tested range
+is used.
+
+| Supplied by the library | Implemented here |
+| --- | --- |
+| PKCE: verifier syntax, S256 computation (`CodeVerifier`, `CodeChallenge`) | the policy that S256 is the only accepted method |
+| RFC 8414 authorization server metadata: field names, JSON shape | the values in it, and the claim that each one is true |
+| Authorization and token request parsing, error objects, token responses, revocation requests | which requests are honoured, and every decision about whether to honour one |
+| `ClientID`, `Scope`, `State`, `AuthorizationCode`, `BearerAccessToken` types | the storage, lifetime, binding and rotation of everything they name |
+| — | RFC 9728 protected resource metadata, which has no type in the shipped SDK version |
+| — | the `WWW-Authenticate` challenge |
+| — | consent, CSRF, GitBucket account resolution, scope enforcement, the CIMD fetcher and its SSRF controls, and the schema |
+
+Randomness and hashing are the JDK's `SecureRandom` and `MessageDigest`. No
+cryptography is implemented here, and nothing in the table's right-hand column
+is described anywhere in this repository as coming from the library.
 
 ## Boundaries
 
@@ -116,6 +150,14 @@ The discovery documents describe only implemented behaviour. In particular
 plain method is not accepted; `grant_types_supported` lists only
 `authorization_code` and `refresh_token`; and no `registration_endpoint` is
 published, because dynamic registration is not implemented.
+
+## Tested versions
+
+Compiled, and the unit suite executed, against the runtime classpaths of
+GitBucket **4.46.0**, **4.47.0** and **4.48.0**, each with the
+`oauth2-oidc-sdk` version that release ships (11.33 for 4.46.0, 11.38.2 for
+the other two). Those three are what has been run; versions between or beyond
+them are untested rather than known-good.
 
 ## Configuration
 

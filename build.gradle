@@ -21,6 +21,11 @@ dependencies {
     compileOnly 'javax.servlet:javax.servlet-api:4.0.1'
     compileOnly 'com.fasterxml.jackson.core:jackson-databind:2.15.2'
     compileOnly 'com.github.takezoe:blocking-slick_2.13:0.0.14'
+    // Already on GitBucket's runtime classpath (it uses Nimbus for its own
+    // OpenID Connect sign-in), so this is compileOnly and is not bundled.
+    // Pinned to the version shipped by the oldest supported GitBucket, 4.46.0,
+    // so only API present across the tested range is used.
+    compileOnly 'com.nimbusds:oauth2-oidc-sdk:11.33'
 
     testImplementation 'org.scalatest:scalatest_2.13:3.2.18'
     testImplementation 'org.scalatestplus:junit-4-13_2.13:3.2.18.0'
@@ -28,6 +33,8 @@ dependencies {
     testImplementation 'com.fasterxml.jackson.core:jackson-databind:2.15.2'
     testCompileOnly 'io.github.gitbucket:gitbucket_2.13:4.46.0'
     testCompileOnly 'javax.servlet:javax.servlet-api:4.0.1'
+    testCompileOnly 'com.nimbusds:oauth2-oidc-sdk:11.33'
+    testRuntimeOnly 'com.nimbusds:oauth2-oidc-sdk:11.33'
     testRuntimeOnly 'io.github.gitbucket:gitbucket_2.13:4.46.0'
     testRuntimeOnly 'javax.servlet:javax.servlet-api:4.0.1'
     testRuntimeOnly 'com.github.takezoe:blocking-slick_2.13:0.0.14'

@@ -113,6 +113,19 @@ class OAuthFoundationSpec extends AnyFunSuite with Matchers {
       .get("authorization_response_iss_parameter_supported").asBoolean() shouldBe true
   }
 
+  test("the authorization server document parses back as RFC 8414 metadata") {
+    // Round-tripping through the SDK's parser is what establishes that the
+    // document is well-formed metadata rather than a JSON object that happens
+    // to have the right key names.
+    val json = Metadata.authorizationServer(mapper, config).toString
+    val parsed = com.nimbusds.oauth2.sdk.`as`.AuthorizationServerMetadata.parse(json)
+    parsed.getIssuer.getValue shouldBe config.issuer
+    parsed.getAuthorizationEndpointURI.toString shouldBe config.authorizationEndpoint
+    parsed.getTokenEndpointURI.toString shouldBe config.tokenEndpoint
+    parsed.getCodeChallengeMethods.size shouldBe 1
+    parsed.supportsAuthorizationResponseIssuerParam() shouldBe true
+  }
+
   test("no OIDC scope or userinfo endpoint is advertised, because neither is implemented") {
     val n = Metadata.authorizationServer(mapper, config)
     n.has("userinfo_endpoint") shouldBe false
@@ -190,6 +203,20 @@ class OAuthFoundationSpec extends AnyFunSuite with Matchers {
     challenge should not include "+"
     challenge should not include "/"
     challenge should fullyMatch regex "[A-Za-z0-9_-]+"
+  }
+
+  test("the challenge agrees with the library's own computation") {
+    // The SHA-256 and base64url are the SDK's; this asserts the adapter asks
+    // it rather than reimplementing it beside it.
+    val verifier = new com.nimbusds.oauth2.sdk.pkce.CodeVerifier("e" * 50)
+    val fromLibrary = com.nimbusds.oauth2.sdk.pkce.CodeChallenge
+      .compute(com.nimbusds.oauth2.sdk.pkce.CodeChallengeMethod.S256, verifier).getValue
+    Pkce.challengeFor(verifier.getValue) shouldBe fromLibrary
+    Pkce.verify(verifier.getValue, fromLibrary) shouldBe true
+  }
+
+  test("the advertised method is the library's S256 constant") {
+    Pkce.supportedMethod shouldBe com.nimbusds.oauth2.sdk.pkce.CodeChallengeMethod.S256
   }
 
   test("the published RFC 7636 appendix B vector is reproduced") {
