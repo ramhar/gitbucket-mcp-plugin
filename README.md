@@ -7,43 +7,59 @@
 
 A [GitBucket](https://github.com/gitbucket/gitbucket) plugin that embeds a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server directly inside GitBucket. AI coding assistants (Claude, Cursor, VS Code Copilot, etc.) can read and manage your GitBucket repositories, issues, and pull requests over MCP — no separate service or proxy required.
 
+Two ways to authenticate: HTTP Basic with a GitBucket account, and OAuth 2.1 with PKCE for clients that expect a browser authorization flow, such as ChatGPT's web connector. Either way the caller is a GitBucket account and every tool is subject to that account's repository permissions. See [docs/authentication.md](docs/authentication.md).
+
 ## Features
 
-14 MCP tools covering the most common developer workflows:
+19 MCP tools covering the most common developer workflows. Each one declares
+whether it reads or writes, which is what an OAuth grant's scope is checked
+against; a Basic-auth caller holds both.
+
+### Identity
+
+| Tool | Scope | Description |
+|------|-------|-------------|
+| `whoami` | `mcp:read` | The GitBucket account this connection is authenticated as |
 
 ### Repository tools
 
-| Tool | Description |
-|------|-------------|
-| `list_repositories` | List repositories accessible to a user or organization |
-| `get_repository` | Get repository metadata, branches, and tags |
+| Tool | Scope | Description |
+|------|-------|-------------|
+| `list_repositories` | `mcp:read` | List repositories accessible to a user or organization |
+| `get_repository` | `mcp:read` | Get repository metadata, branches, and tags |
 
 ### Issue tools
 
-| Tool | Description |
-|------|-------------|
-| `list_issues` | List issues in a repository (open / closed / all) |
-| `get_issue` | Get issue details and comment count |
-| `create_issue` | Create a new issue |
-| `close_issue` | Close an issue with an optional comment |
-| `reopen_issue` | Reopen a closed issue |
-| `add_issue_comment` | Add a comment to an issue |
+| Tool | Scope | Description |
+|------|-------|-------------|
+| `list_issues` | `mcp:read` | List issues in a repository (open / closed / all) |
+| `get_issue` | `mcp:read` | Get issue details and comment count |
+| `create_issue` | `mcp:write` | Create a new issue |
+| `close_issue` | `mcp:write` | Close an issue with an optional comment |
+| `reopen_issue` | `mcp:write` | Reopen a closed issue |
+| `add_issue_comment` | `mcp:write` | Add a comment to an issue |
+| `update_own_comment` | `mcp:write` | Edit a comment the authenticated account wrote |
 
 ### Pull request tools
 
-| Tool | Description |
-|------|-------------|
-| `list_pull_requests` | List pull requests (open / closed / all) |
-| `get_pull_request` | Get pull request details and comment count |
-| `add_pr_comment` | Add a comment to a pull request |
-| `close_pull_request` | Close a PR without merging, with an optional comment |
-| `reopen_pull_request` | Reopen a closed pull request |
-| `get_pr_diff` | List changed files and patches for a pull request |
+| Tool | Scope | Description |
+|------|-------|-------------|
+| `list_pull_requests` | `mcp:read` | List pull requests (open / closed / all) |
+| `get_pull_request` | `mcp:read` | Get pull request details and comment count |
+| `get_pr_diff` | `mcp:read` | List changed files and patches for a pull request |
+| `get_thread_comments` | `mcp:read` | Read a pull request's review thread |
+| `add_pr_comment` | `mcp:write` | Add a comment to a pull request |
+| `close_pull_request` | `mcp:write` | Close a PR without merging, with an optional comment |
+| `reopen_pull_request` | `mcp:write` | Reopen a closed pull request |
+| `update_pull_request` | `mcp:write` | Change a pull request's title or body |
+| `mark_ready_for_review` | `mcp:write` | Take a draft pull request out of draft |
 
 ## Requirements
 
-- **GitBucket**: 4.42.0 – 4.46.0
+- **GitBucket**: 4.46.0, 4.47.0 or 4.48.0 (see [compatibility](#gitbucket-version-compatibility))
 - **Java**: 17 or 21 (required by GitBucket 4.42+)
+- **A database**: H2 (GitBucket's default) or PostgreSQL. The OAuth tables are
+  created by the plugin's own migration on first start.
 
 ## Installation
 
@@ -77,7 +93,30 @@ Once installed, the plugin exposes:
 | `GET  http://<host>/plugin-mcp/health` | Health check |
 | `GET  http://<host>/plugin-mcp/sse` | SSE endpoint event (for SSE-capable clients) |
 
-Authentication uses **HTTP Basic Auth** with your GitBucket credentials.
+With OAuth configured, five more:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET  http://<host>/.well-known/oauth-protected-resource` | RFC 9728 resource metadata |
+| `GET  http://<host>/.well-known/oauth-authorization-server` | RFC 8414 authorization server metadata |
+| `GET\|POST http://<host>/plugin-mcp/oauth/authorize` | Consent, on your GitBucket session |
+| `POST http://<host>/plugin-mcp/oauth/token` | Code exchange and refresh |
+| `POST http://<host>/plugin-mcp/oauth/revoke` | RFC 7009 revocation |
+
+**HTTP Basic Auth** with your GitBucket credentials works with no configuration
+and is unchanged. **OAuth** is off until an operator sets this plugin's external
+base URL:
+
+```
+-Dgitbucket.mcp.oauth.baseUrl=https://git.example.com
+```
+
+The identifiers the plugin publishes are derived from that one value and never
+from a request header, so a `Host` or `X-Forwarded-Host` a client controls
+cannot move the issuer. Without it the discovery documents answer 404 and
+Bearer tokens are refused; nothing else changes. The full picture — scopes,
+token lifetimes, revocation, what the plugin implements itself and what comes
+from a library — is in [docs/authentication.md](docs/authentication.md).
 
 ## MCP Client Configuration
 
@@ -108,6 +147,24 @@ echo -n "user:password" | base64
 
 Use the HTTP transport URL `http://localhost:8080/plugin-mcp/` with Basic auth headers, matching your client's MCP settings format.
 
+### Clients that authorize in a browser
+
+A client that speaks MCP authorization — ChatGPT's web connector, for example —
+needs only the server URL. It reads
+`/.well-known/oauth-protected-resource`, follows it to the authorization server
+metadata, registers itself by publishing a client ID metadata document (no
+pre-registration with this server, and no client secret), and sends you to
+GitBucket's own sign-in and then to a consent screen. You choose read-only or
+read and write; the token it receives acts as your account and can do nothing
+your account cannot.
+
+This requires `gitbucket.mcp.oauth.baseUrl` and a GitBucket the client can
+reach over HTTPS. Testing so far has been against the protocol rather than
+against a particular product's client: the flow is exercised end to end by
+`itest/oauth_controls.py` over real HTTP, which is not the same as having
+connected a given commercial client. [docs/authentication.md](docs/authentication.md)
+says exactly what has and has not been tried.
+
 ### Manual testing with curl
 
 ```bash
@@ -135,14 +192,20 @@ npx @modelcontextprotocol/inspector \
 
 ## GitBucket Version Compatibility
 
-| GitBucket | Status | Notes |
-|-----------|--------|-------|
-| 4.46.0 | ✅ Supported | Current target |
-| 4.45.0 | ✅ Supported | |
-| 4.44.0 | ✅ Supported | |
-| 4.43.0 | ✅ Supported | H2 1.x → 2.x DB migration (no plugin API change) |
-| 4.42.0 | ✅ Supported | Minimum supported version; Java 17 required |
-| < 4.42.0 | ❌ Not supported | Plugin API incompatible |
+Three versions are tested, by compiling and running the unit suite against
+each release's own runtime classpath, including the `oauth2-oidc-sdk` version
+that release ships:
+
+| GitBucket | `oauth2-oidc-sdk` | Status |
+|-----------|-------------------|--------|
+| 4.48.0 | 11.38.2 | ✅ Tested |
+| 4.47.0 | 11.38.2 | ✅ Tested |
+| 4.46.0 | 11.33 | ✅ Tested |
+
+Versions below 4.46.0 are untested rather than known broken: the plugin uses
+`anonymousAccessiblePaths`, which earlier releases may not have, and the OAuth
+code depends on `oauth2-oidc-sdk` being on the host's classpath. Anything
+outside the table above has not been run.
 
 ## Development
 
@@ -158,20 +221,34 @@ npx @modelcontextprotocol/inspector \
 ./gradlew test
 ```
 
-55 tests covering JSON-RPC protocol parsing, tool registry, schema validation, and argument parsing.
+240 tests covering JSON-RPC protocol parsing, the tool registry, schema
+validation, argument parsing, repository authorization, the OAuth grant store
+against a real database created by the plugin's own migration, and the client
+metadata fetcher's SSRF policy.
 
 ### Integration tests
 
-Requires a running GitBucket instance with the plugin installed:
+Requires a **disposable** GitBucket instance with the plugin installed. Both
+harnesses build their own fixtures and refuse to run against an instance that
+is not blank, but they create accounts and repositories and should never be
+pointed at anything you care about.
 
 ```bash
 ./gradlew shadowJar
 cp build/libs/gitbucket-mcp-plugin-*.jar $GITBUCKET_HOME/plugins/
-# start GitBucket...
-python3 scripts/integration_test.py --host localhost --port 8080 --user root --password root
+# start GitBucket on 127.0.0.1:8099, with OAuth configured for the second suite:
+#   -Dgitbucket.mcp.oauth.baseUrl=http://localhost:8099
+#   -Dgitbucket.mcp.oauth.allowLoopbackClients=true
+python3 itest/integration.py      # the tools, against GitBucket's own REST API
+python3 itest/oauth_controls.py   # the OAuth flow, over HTTP
 ```
 
-The script creates test fixtures, exercises all 14 tools, and reports a pass/fail summary.
+`integration.py` exercises every tool against each repository visibility and
+each collaborator role, comparing the plugin's answer with GitBucket's own.
+`oauth_controls.py` drives discovery, consent, code exchange, refresh rotation,
+revocation and Bearer-authenticated tool calls through the real endpoints, and
+checks what GitBucket stored rather than what the plugin replied. See
+[itest/README.md](itest/README.md).
 
 ## Contributing
 

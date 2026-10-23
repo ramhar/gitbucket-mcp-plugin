@@ -105,8 +105,21 @@ ChatGPT supports three registration mechanisms. This plugin implements one.
 Fetching a metadata document means the server makes an outbound request to a
 URL a caller supplied, which is a server-side request forgery primitive if it
 is done carelessly. The fetcher is therefore bounded: HTTPS only, a response
-size and time limit, no redirects followed to a different host, and private,
-loopback and link-local address ranges refused after DNS resolution.
+size and time limit, redirects refused outright rather than followed, and
+private, loopback, link-local, carrier-grade and multicast address ranges
+refused after DNS resolution — every resolved address, not the first, and the
+address of the established connection re-checked after connecting.
+
+Redirects are refused rather than re-validated because an allowed host
+bouncing to a forbidden one is the usual way such a fence is bypassed, and
+there is no legitimate reason for a client's own metadata document to move.
+
+One escape exists, off by default. `gitbucket.mcp.oauth.allowLoopbackClients`
+permits a `client_id` on a loopback address, and opens **loopback only**: the
+private, link-local, carrier-grade and multicast ranges stay forbidden with it
+on. It exists because a developer running an MCP client on the same machine as
+GitBucket otherwise cannot complete an authorization at all. A deployment that
+never sets it behaves exactly as if it did not exist.
 
 ## Tokens
 
@@ -127,12 +140,40 @@ matters when a grant is withdrawn or an account is disabled.
 | refresh token | 30 days, rotated on use | immediate; reuse of a rotated token revokes the whole grant |
 
 Reuse detection applies to races as well as to theft, because the server
-cannot tell them apart. If a client presents the same refresh token twice at
-once, one request rotates it and the other sees a token that has already been
-rotated — which is exactly what a stolen copy looks like — so the grant is
-revoked and **neither** request comes away with a usable credential. A client
-must therefore serialise its refreshes. This is what OAuth 2.1 asks for, and
-it is tested against two real connections rather than assumed.
+cannot tell them apart. A correctly bound refresh token presented a second
+time is treated as reuse and the whole grant is revoked. Nothing about that
+decision identifies the legitimate caller — the server has no way to do so,
+which is precisely why reuse ends the family rather than being arbitrated.
+
+The consequence is an interoperability requirement of this policy, and worth
+stating plainly: **a client must serialise its refreshes.** If it presents the
+same refresh token twice at once, one request rotates it and the other finds a
+token that has already been rotated, the grant is revoked, and neither request
+leaves the client with a credential it can keep using. That is what OAuth 2.1
+asks for; it is a constraint on the client, not a claim about the server's
+ability to tell two callers apart.
+
+Three things are kept distinct, because they are often conflated:
+
+- **The database transition.** One refresh credential cannot produce two
+  independently valid successors, and the chain cannot fork. This holds under
+  any scheduling and is asserted on stored state.
+- **Replay handling.** A correctly bound second presentation revokes the
+  grant, and that revocation is committed whatever the HTTP endpoint answers.
+- **The HTTP result.** A response may already have completed before the
+  revocation landed. It is not undone. The guarantee is stated where it holds:
+  every *subsequent* authorization check refuses credentials from the revoked
+  grant.
+
+A **binding failure is not a replay.** Presenting a refresh token with the
+wrong `client_id` is refused and changes nothing: it does not rotate the
+token, does not revoke the grant, and the legitimate client's next refresh
+still works. The client id is not a secret — anyone who learned a refresh
+token could send it with any client id they liked, and treating that as
+evidence of theft would hand an unauthenticated caller a way to destroy a
+credential that is in legitimate use. The same holds for the authorization
+code: a wrong client, redirect URI, resource or PKCE verifier is refused
+without consuming the code.
 
 Expiry is treated differently on purpose. An expired refresh token is refused
 but does **not** revoke the grant: that is the client being slow, not a
@@ -163,13 +204,47 @@ plain method is not accepted; `grant_types_supported` lists only
 `authorization_code` and `refresh_token`; and no `registration_endpoint` is
 published, because dynamic registration is not implemented.
 
-## Tested versions
+## Storage
+
+The four tables — grant, authorization code, refresh token, access token —
+are created by the plugin's own schema migration, which GitBucket runs at
+startup through Solidbase. Nothing needs to be created by hand, and an
+existing installation of an earlier version of this plugin picks the migration
+up on the next restart.
+
+Two notes for anyone changing that migration. Its root element is a bare
+`<changeSet>`, not a Liquibase `<databaseChangeLog>`: Solidbase supplies the
+wrapper, the change set id and the author, and a file carrying its own root
+parses as a nested changelog and is **skipped silently** — the plugin still
+loads and the first request that needs a table fails. And the version list
+has to be declared on the root-package class named `Plugin`, which is the one
+GitBucket loads by name; it extends `MCPPlugin` so there is a single
+declaration. Both failures happened here, and both are now covered by tests
+that run the real mechanism rather than a convenient substitute.
+
+## What has been tested
 
 Compiled, and the unit suite executed, against the runtime classpaths of
 GitBucket **4.46.0**, **4.47.0** and **4.48.0**, each with the
 `oauth2-oidc-sdk` version that release ships (11.33 for 4.46.0, 11.38.2 for
 the other two). Those three are what has been run; versions between or beyond
 them are untested rather than known-good.
+
+The flow itself is exercised over real HTTP against a disposable GitBucket
+with the plugin installed: discovery, consent, approval, denial and CSRF
+rejection, code exchange and every binding failure, refresh rotation and
+replay, revocation, Bearer authentication, and tool calls through the
+production dispatcher — with the effects read back from GitBucket's own REST
+API rather than from the plugin's replies. Those controls are
+`itest/oauth_controls.py`.
+
+Two things are **not** established by any of that. Connecting a particular
+commercial MCP client is its own gate: a client's behaviour is not the
+protocol, and raw HTTP passing says nothing about whether, say, ChatGPT's
+connector accepts this server. And the storage tests run on H2; the migration
+is written in portable Liquibase change elements and is expected to apply to
+PostgreSQL, but an executed PostgreSQL upgrade is a separate thing from
+generated DDL, and until it has been run it should be read as untested.
 
 ## Configuration
 
@@ -179,3 +254,16 @@ controlled on a reverse-proxied deployment and a resource identifier that
 moves with the request is not an audience binding. A deployment behind a proxy
 or in a servlet context path sets the external URL once; everything else —
 issuer, endpoints, the `resource` value in tokens — is derived from it.
+
+| Property | Default | Effect |
+| --- | --- | --- |
+| `gitbucket.mcp.oauth.baseUrl` | unset | The external base URL. Unset, OAuth is off: discovery answers 404 and Bearer tokens are refused. Basic auth is unaffected. |
+| `gitbucket.mcp.oauth.allowLoopbackClients` | `false` | Permits a `client_id` on a loopback address, and nothing else. |
+
+`GITBUCKET_MCP_OAUTH_BASE_URL` is read if the system property is unset. The
+URL must be `https://`, except on `localhost` or `127.0.0.1` where plain HTTP
+is allowed so the suites can run, and it must carry no trailing slash, query
+or fragment. A value that fails any of these is rejected with a reason rather
+than normalised, and OAuth stays off — a bearer token on a cleartext
+connection is a bearer token for whoever is on the path, and a base URL that
+quietly becomes something else is not an audience binding.
