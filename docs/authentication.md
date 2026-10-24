@@ -362,10 +362,13 @@ administrator flag.
 That is the whole of the claim, and it is narrower than "the connector
 works":
 
-- **Refresh and revocation are not established by it.** Both connections were
-  used inside the lifetime of their grants. Rotation, replay and revocation do
-  have evidence — `itest/oauth_controls.py` over raw HTTP — but not from a
-  commercial client.
+- **Refresh and revocation are not established by it.** Neither was observed
+  on either connection: no rotation, no replay, no revocation. For the ChatGPT
+  connection that is a statement about an OAuth grant. For the second client
+  it is simply that nothing of the kind was seen — its authentication path is
+  not recorded here, so it is not claimed to hold a grant at all. Rotation,
+  replay and revocation do have evidence — `itest/oauth_controls.py` over raw
+  HTTP — but none of it from a commercial client.
 - **Neither is the permission matrix.** One administrator and one ordinary
   account are two accounts, not the visibility × role × `issuesOption` matrix.
   A read that succeeds for an administrator says nothing about a guest. That
