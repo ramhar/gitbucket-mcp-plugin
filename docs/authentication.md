@@ -106,9 +106,27 @@ Fetching a metadata document means the server makes an outbound request to a
 URL a caller supplied, which is a server-side request forgery primitive if it
 is done carelessly. The fetcher is therefore bounded: HTTPS only, a response
 size and time limit, redirects refused outright rather than followed, and
-private, loopback, link-local, carrier-grade and multicast address ranges
-refused after DNS resolution — every resolved address, not the first, and the
-address of the established connection re-checked after connecting.
+private, loopback, link-local, unique-local, carrier-grade and multicast
+address ranges refused after DNS resolution — every resolved address, not the
+first. An IPv4 address written in IPv6 notation is unwrapped and judged as the
+address it is.
+
+**The request goes to the address that was checked.** This is the part that is
+easy to get wrong, and this fetcher did: checking an address and then handing a
+host *name* to a URL connection checks nothing, because the connection
+resolves the name again, independently, and that second answer decides where
+the request goes. Verifying afterwards is later still, since a response only
+exists once the request has been sent — and sending it is the whole of the
+injury. Neither `HttpURLConnection` nor `java.net.http.HttpClient` can be told
+which address to use, so the socket is opened directly and connected to the
+validated address.
+
+Pinning the address gives up nothing about authenticating the peer. The socket
+is layered with the original host name and
+`setEndpointIdentificationAlgorithm("HTTPS")`, so the JDK performs its usual
+certificate name check against the name; SNI carries the name too. No proxy is
+consulted, because a proxied request goes wherever the proxy decides and
+destination control would be an illusion.
 
 Redirects are refused rather than re-validated because an allowed host
 bouncing to a forbidden one is the usual way such a fence is bypassed, and
@@ -171,13 +189,42 @@ token, does not revoke the grant, and the legitimate client's next refresh
 still works. The client id is not a secret — anyone who learned a refresh
 token could send it with any client id they liked, and treating that as
 evidence of theft would hand an unauthenticated caller a way to destroy a
-credential that is in legitimate use. The same holds for the authorization
-code: a wrong client, redirect URI, resource or PKCE verifier is refused
-without consuming the code.
+credential that is in legitimate use.
 
-Expiry is treated differently on purpose. An expired refresh token is refused
-but does **not** revoke the grant: that is the client being slow, not a
-credential being somewhere it should not be.
+The same holds for the authorization code, and for a code that has **already
+been spent**. The bindings are checked first, so a wrong client, redirect URI,
+resource or PKCE verifier against a used code is refused on its own terms and
+the grant it bought survives. Revoking on replay is defensible only for a
+presentation that could have come from the legitimate client; whoever captured
+a code but not the PKCE verifier must not be able to end the session with it.
+A correctly bound replay still revokes.
+
+Losing a race is treated as a replay, because it is one. When the conditional
+claim on a code matches no row, the row is re-read: if something else took it,
+the presentation was correctly bound and arrived second, which is the same
+situation as an outright replay and gets the same policy.
+
+Expiry is treated differently on purpose. An expired credential is refused but
+does **not** revoke the grant: that is the client being slow, not a credential
+being somewhere it should not be. This applies to a superseded refresh token
+whose own expiry has passed as well — it is dead of old age, not evidence, and
+treating it as a replay would let an old useless token destroy the successor
+the legitimate client is using. Cleanup only removes credentials that are
+already expired, so the unexpired superseded rows that replay detection needs
+are never swept away.
+
+### The audience is checked where the credential is used
+
+A grant records the resource it was issued for. That is only a fact in a table
+until it is compared with the resource this server actually is, and the
+comparison belongs at the point of use: a token outlives the request that
+created it, so a reconfigured deployment — or a neighbouring one sharing a
+database — presents a perfectly valid, unexpired credential for somewhere
+else. Every bearer request checks it before a tool is chosen, and refuses a
+mismatch exactly like any other unusable token, so the refusal reveals
+nothing. Rotation treats the audience as a binding alongside the client id,
+both the resource this server is and the resource the client asked for, so a
+mismatch consumes nothing and revokes nothing.
 
 ## Scopes
 
@@ -260,16 +307,26 @@ MCP client is its own gate: a client's behaviour is not the protocol, and raw
 HTTP passing says nothing about whether, say, ChatGPT's connector accepts
 this server.
 
+A separate gate, `itest/resource_gate.py`, covers the audience check the way
+only a restart can: one server issues a grant while it calls itself one
+resource, the same server restarts as another, and the unexpired credential is
+presented again. It then restores the original configuration and checks that
+the refused credentials still work, so a refusal is a refusal rather than a
+quiet destruction.
+
 ### The guards have been shown to fail
 
 A suite that passes says nothing until a broken implementation makes it fail.
-Five single-line mutations of production source — the scope gate permitting
+Nine single-line mutations of production source — the scope gate permitting
 everything, a code's `redirect_uri` binding unchecked, a refresh token's
-client binding unchecked, the SSRF fence opened, and PKCE accepted without
-verification — each turn the suite red on the controls written for that
-guard, and the source is restored byte-for-byte afterwards. The first of
-those mutations originally left the suite green, which is how the scope gate
-turned out to have no offline control at all; it has one now.
+client binding unchecked, the SSRF fence opened, PKCE accepted without
+verification, the request resolving the host again instead of using the
+checked address, a spent code judged before its bindings, a rotation failure
+ignoring expiry, and the audience of a refresh grant unchecked — each turn the
+suite red on the controls written for that guard, and the source is restored
+byte-for-byte afterwards. The first of those mutations originally left the
+suite green, which is how the scope gate turned out to have no offline control
+at all; it has one now.
 
 ## Configuration
 

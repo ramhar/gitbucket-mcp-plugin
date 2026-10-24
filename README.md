@@ -270,6 +270,17 @@ surviving, and grants and revocations surviving a restart. Add
 same sequence against PostgreSQL instead of the bundled H2; without it the
 PostgreSQL path is generated DDL, not an executed migration.
 
+A fourth harness checks the audience binding, which needs a restart to
+observe: it issues a grant while the server is configured as one resource,
+restarts the same server as another, and presents the credential again.
+
+```bash
+python3 itest/resource_gate.py \
+  --war gitbucket.war \
+  --candidate build/libs/gitbucket-mcp-plugin-*.jar \
+  --home /tmp/gb-resource        # must not exist, or be empty
+```
+
 `integration.py` exercises every tool against each repository visibility and
 each collaborator role, comparing the plugin's answer with GitBucket's own.
 `oauth_controls.py` drives discovery, consent, code exchange, refresh rotation,

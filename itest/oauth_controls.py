@@ -137,10 +137,29 @@ def controls(host):
     check("C6 the access token acts as the consenting account",
           (st, kind, payload.get("login")), (200, "ok", "owner1"))
 
-    st, b = redeem(code, client, REDIRECT, verifier)
-    check("C7 replaying the code is refused", (st, error_of(b)), (400, "invalid_grant"))
+    # A spent code is not a credential, and possessing one is not evidence.
+    # Revoking on replay is defensible only for a presentation that could have
+    # come from the legitimate client; it used to fire for any of these, so
+    # anyone holding a used code could end a live session.
+    for label, args, kw, expected in (
+            ("client", (code, other, REDIRECT, verifier), {}, "invalid_grant"),
+            ("redirect", (code, client, "https://client.example.com/elsewhere", verifier), {},
+             "invalid_grant"),
+            ("resource", (code, client, REDIRECT, verifier),
+             {"resource": "https://elsewhere.example.com/mcp/"}, "invalid_target"),
+            ("verifier", (code, client, REDIRECT, pkce()[0]), {}, "invalid_grant")):
+        st, b = redeem(*args, **kw)
+        check(f"C7 a wrong {label} on a spent code is refused",
+              (st, error_of(b)), (400, expected))
     st, _, body = tool(access, "whoami", {})
-    check("C8 and the replay's revocation is committed: the issued token stops working",
+    kind, payload = outcome(body)
+    check("C7 and none of those four revoked the grant: the token still works",
+          (st, kind, payload.get("login")), (200, "ok", "owner1"))
+
+    st, b = redeem(code, client, REDIRECT, verifier)
+    check("C8 a correctly bound replay is refused", (st, error_of(b)), (400, "invalid_grant"))
+    st, _, body = tool(access, "whoami", {})
+    check("C8 and its revocation is committed: the issued token stops working",
           (st, "access token" in rpc_error_message(body)), (401, True))
 
     # ── D. bearer credentials ────────────────────────────────────────────────
