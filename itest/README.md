@@ -68,6 +68,19 @@ It refuses to start if something else is already serving the port: a leftover
 server answers health checks and would otherwise be mistaken for the artifact
 under test. It stops every process it started, including when it aborts.
 
+## The repository listing
+
+`repo_list_gate.py` checks the listing's counters against GitBucket's own REST
+API rather than against the plugin's other answers, because the original
+defect made two plugin answers disagree and comparing them to each other would
+have been the only way to see it. Its fixture holds a repository with real
+issues and a pull request, one that is legitimately empty, a private one, and
+a real fork, so a correct zero is distinguishable from an unpopulated field.
+
+```sh
+python3 itest/repo_list_gate.py
+```
+
 `oauth_gate.py` holds the flow helpers — a local HTTP server that publishes
 client metadata documents, PKCE, a non-following HTTP client so redirects are
 inspected rather than followed, and the walk through the real consent screen.

@@ -28,6 +28,25 @@ against; a Basic-auth caller holds both.
 | `list_repositories` | `mcp:read` | List repositories accessible to a user or organization |
 | `get_repository` | `mcp:read` | Get repository metadata, branches, and tags |
 
+Both tools report the same counters, and they mean what GitBucket means by
+them, which is narrower than the names suggest:
+
+| Field | Meaning |
+|-------|---------|
+| `issue_count` | **Open** issues, **excluding** pull requests |
+| `pr_count` | **Open** pull requests |
+| `fork_count` | How many forks exist of this repository's origin. It is **not** a flag that this repository is itself a fork. |
+| `is_fork` | Whether this repository is a fork, by GitBucket's own test — it has an origin. |
+
+Each response repeats those meanings in `issue_count_semantics`,
+`pr_count_semantics` and `fork_count_semantics`, so a reader does not have to
+assume they are totals.
+
+`without_forked` on `list_repositories` excludes repositories that are
+themselves forks. Counters are read per repository, for the repositories the
+caller may read and no others, so a listing costs one repository read per
+visible entry.
+
 ### Issue tools
 
 | Tool | Scope | Description |
