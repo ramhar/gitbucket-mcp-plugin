@@ -18,9 +18,29 @@ and an empty `GITBUCKET_HOME`:
 
 ```sh
 java -jar gitbucket.war --port=8099 --host=127.0.0.1 --gitbucket.home=/tmp/gb-itest
-# drop the plugin JAR into /tmp/gb-itest/plugins/ and restart
-MCP_PLUGIN_JAR=/tmp/gb-itest/plugins/gitbucket-mcp-plugin-*.jar python3 itest/integration.py
+# install the artifact you intend to test, keeping a copy outside the
+# directory GitBucket scans, and restart
+cp build/libs/gitbucket-mcp-plugin-0.1.0.jar /tmp/candidate.jar
+cp /tmp/candidate.jar /tmp/gb-itest/plugins/
+MCP_PLUGIN_JAR=/tmp/candidate.jar python3 itest/integration.py
 ```
+
+**Give it one concrete path.** A glob does not work here: the shell does not
+expand `*` inside an assignment word, so
+`MCP_PLUGIN_JAR=.../gitbucket-mcp-plugin-*.jar` passes the asterisk through
+literally and the gate exits 2 with *does not name a readable file* before it
+reaches HTTP. If the name is not known ahead of time, resolve it and check
+that it resolved to exactly one file:
+
+```sh
+set -- /tmp/gb-itest/plugins/gitbucket-mcp-plugin-*.jar
+[ $# -eq 1 ] && [ -f "$1" ] || { echo "expected exactly one JAR, got $#"; exit 2; }
+MCP_PLUGIN_JAR=$1 python3 itest/integration.py
+```
+
+Keeping the copy you point at **outside** `plugins/` avoids the other trap:
+GitBucket copies what it loads into `plugins/.installed/` and rebuilds that
+directory on each scan, so a path into it is not stable.
 
 `MCP_PLUGIN_JAR` is required, not optional. The gate compares the version the
 plugin reports with the descriptor packaged in that JAR; checking it against a

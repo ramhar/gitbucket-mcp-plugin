@@ -277,10 +277,17 @@ cp build/libs/gitbucket-mcp-plugin-*.jar $GITBUCKET_HOME/plugins/
 # start GitBucket on 127.0.0.1:8099, with OAuth configured for the second suite:
 #   -Dgitbucket.mcp.oauth.baseUrl=http://localhost:8099
 #   -Dgitbucket.mcp.oauth.allowLoopbackClients=true
-MCP_PLUGIN_JAR=$GITBUCKET_HOME/plugins/gitbucket-mcp-plugin-*.jar \
+# keep a copy of the exact artifact outside the directory GitBucket scans
+cp build/libs/gitbucket-mcp-plugin-0.1.0.jar /tmp/candidate.jar
+MCP_PLUGIN_JAR=/tmp/candidate.jar \
   python3 itest/integration.py    # the tools, against GitBucket's own REST API
 python3 itest/oauth_controls.py   # the OAuth flow, over HTTP
 ```
+
+`MCP_PLUGIN_JAR` must be **one concrete path**. A glob there does not work:
+the shell leaves `*` unexpanded inside an assignment word and the gate exits 2
+before it reaches HTTP. `itest/README.md` has the form to use when the file
+name is not known ahead of time.
 
 `integration.py` needs `MCP_PLUGIN_JAR` to name the exact JAR installed on the
 instance, so the version the plugin reports can be compared with the
