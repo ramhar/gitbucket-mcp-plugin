@@ -273,6 +273,7 @@ private[tools] class TestUpdatePullRequestTool(val world: ToolWorld)
 private[tools] class TestMarkReadyTool(val world: ToolWorld) extends MarkReadyForReviewTool with StubPullRequests
 private[tools] class TestGetPullRequestTool(val world: ToolWorld) extends GetPullRequestTool with StubPullRequests
 private[tools] class TestListRepositoriesTool(val world: ToolWorld) extends ListRepositoriesTool with StubCommon
+private[tools] class TestGetRepositoryTool(val world: ToolWorld) extends GetRepositoryTool with StubCommon
 
 @RunWith(classOf[JUnitRunner])
 class ToolExecutionSpec extends AnyFunSuite with Matchers {
@@ -774,5 +775,125 @@ class ToolExecutionSpec extends AnyFunSuite with Matchers {
     payload(
       new TestListRepositoriesTool(w).execute(args("""{"owner":"example-org"}"""), account("guest"), request, mapper)
     ).get("count").asInt() shouldBe 2
+  }
+
+  // ── the record that is published is the record that is authorized ─────────
+  //
+  // The listing reads twice: once to enumerate, once per repository for the
+  // counts. Those are different snapshots. A repository that was public when
+  // enumerated and private when read in detail used to be published under the
+  // first decision -- with the description and counts that only exist in the
+  // private state. The fix authorizes the second record, the one actually
+  // being serialized.
+  //
+  // `world.userRepositories` and `world.repositories` are deliberately given
+  // *different* objects for the same repository, which is what makes the two
+  // snapshots distinguishable at all.
+
+  test("a repository that became private between the two reads is not published") {
+    val w = new ToolWorld
+    val enumerated = repoInfo("example-org", "transition", isPrivate = false)
+    val fresh = enumerated.copy(
+      repository = enumerated.repository.copy(
+        isPrivate = true, description = Some("private-only-marker")),
+      issueCount = 17, pullCount = 9)
+    w.userRepositories("example-org") = List(enumerated)
+    w.repositories(("example-org", "transition")) = fresh
+
+    val view = payload(new TestListRepositoriesTool(w)
+      .execute(args("""{"owner":"example-org"}"""), account("outsider"), request, mapper))
+
+    withClue(s"$view: ") {
+      view.get("count").asInt() shouldBe 0
+      view.get("repositories").size() shouldBe 0
+      // Nothing that exists only in the private snapshot may appear anywhere
+      // in the response, counts included.
+      view.toString should not include "private-only-marker"
+      view.toString should not include "17"
+      view.toString should not include "\"is_private\":true"
+    }
+  }
+
+  test("the detail tool refuses the same transitioned repository") {
+    // The two tools have to agree: a listing that publishes what the detail
+    // read refuses is the disclosure, whichever way round it is.
+    val w = new ToolWorld
+    val enumerated = repoInfo("example-org", "transition", isPrivate = false)
+    w.userRepositories("example-org") = List(enumerated)
+    w.repositories(("example-org", "transition")) =
+      enumerated.copy(repository = enumerated.repository.copy(isPrivate = true))
+
+    val thrown = intercept[NoSuchElementException] {
+      new TestGetRepositoryTool(w)
+        .execute(args("""{"owner":"example-org","repo":"transition"}"""), account("outsider"), request, mapper)
+    }
+    thrown.getMessage should include("not found or not readable")
+  }
+
+  test("stable public data is still published after the second read") {
+    // The guard must not cost the ordinary case: the same object in both
+    // snapshots is published, with its counts.
+    val w = new ToolWorld
+    val open = repoInfo("example-org", "open").copy(issueCount = 4, pullCount = 2)
+    w.userRepositories("example-org") = List(open)
+    w.repositories(("example-org", "open")) = open
+
+    val view = payload(new TestListRepositoriesTool(w)
+      .execute(args("""{"owner":"example-org"}"""), account("outsider"), request, mapper))
+    view.get("count").asInt() shouldBe 1
+    view.get("repositories").get(0).get("issue_count").asInt() shouldBe 4
+    view.get("repositories").get(0).get("pr_count").asInt() shouldBe 2
+  }
+
+  test("stable private data is published to every caller GitBucket permits") {
+    val w = new ToolWorld
+    val secret = repoInfo("example-org", "secret", isPrivate = true).copy(issueCount = 5)
+    w.userRepositories("example-org") = List(secret)
+    w.repositories(("example-org", "secret")) = secret
+    w.guests += (("example-org", "secret", "guest"))
+    w.developers += (("example-org", "secret", "dev"))
+
+    // Guest, developer and administrator only. These stubs model GitBucket's
+    // role predicates, not its ownership rule, so an owner has no role here;
+    // the owner's own access to a private repository is covered against real
+    // GitBucket in itest/repo_list_gate.py rather than asserted against a
+    // fixture that does not implement it.
+    Seq("guest", "dev").foreach { who =>
+      withClue(s"$who: ") {
+        val view = payload(new TestListRepositoriesTool(w)
+          .execute(args("""{"owner":"example-org"}"""), account(who), request, mapper))
+        view.get("count").asInt() shouldBe 1
+        view.get("repositories").get(0).get("issue_count").asInt() shouldBe 5
+      }
+    }
+    val admin = payload(new TestListRepositoriesTool(w)
+      .execute(args("""{"owner":"example-org"}"""), account("root", admin = true), request, mapper))
+    admin.get("count").asInt() shouldBe 1
+  }
+
+  test("a role that was sufficient at enumeration and is gone at the detail read") {
+    // The same shape as the privacy transition, from the other direction: the
+    // caller's access disappears rather than the repository's visibility
+    // changing. The enumeration object is readable to the guest; the fresh one
+    // is private and the role has been dropped by then.
+    val w = new ToolWorld
+    val enumerated = repoInfo("example-org", "secret", isPrivate = true)
+    w.userRepositories("example-org") = List(enumerated)
+    w.repositories(("example-org", "secret")) =
+      enumerated.copy(repository = enumerated.repository.copy(
+        description = Some("still-private-marker")), issueCount = 11)
+    w.guests += (("example-org", "secret", "guest"))
+
+    val permitted = payload(new TestListRepositoriesTool(w)
+      .execute(args("""{"owner":"example-org"}"""), account("guest"), request, mapper))
+    permitted.get("count").asInt() shouldBe 1
+
+    w.guests -= (("example-org", "secret", "guest"))
+    val revoked = payload(new TestListRepositoriesTool(w)
+      .execute(args("""{"owner":"example-org"}"""), account("guest"), request, mapper))
+    withClue(s"$revoked: ") {
+      revoked.get("count").asInt() shouldBe 0
+      revoked.toString should not include "still-private-marker"
+    }
   }
 }

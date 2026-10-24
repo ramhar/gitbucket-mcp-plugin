@@ -70,7 +70,21 @@ class ListRepositoriesTool extends ToolDef with RepoService {
     var published = 0
     selected.foreach { candidate =>
       val r = candidate.repository
-      getRepository(r.userName, r.repositoryName).foreach { info =>
+      // The record that gets published is authorized, not the one that was
+      // enumerated. Those are two separate reads, and between them a
+      // repository can become private: the enumeration snapshot said public,
+      // the detail read returns the new private description and counts, and
+      // publishing that under the earlier decision discloses it. The early
+      // filter above still has its own job -- it keeps repositories the caller
+      // never had access to from being read at all -- but it cannot speak for
+      // a record it has not seen.
+      //
+      // A repository that stops being readable in between is omitted, and the
+      // count is of what was published, so the two stay consistent. This
+      // claims no atomicity: a decision taken before a change cannot be
+      // withdrawn afterwards. It only refuses to attach an old decision to
+      // newly read data.
+      getRepository(r.userName, r.repositoryName).filter(canRead(_, account)).foreach { info =>
         val n = mapper.createObjectNode()
         n.put("name",           info.repository.repositoryName)
         n.put("owner",          info.repository.userName)
