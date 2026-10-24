@@ -1,7 +1,6 @@
 package com.newsrx.mcpplugin.oauth
 
-import java.io.{BufferedInputStream, InputStream}
-import java.net.{HttpURLConnection, InetAddress, URI, URL}
+import java.net.{InetAddress, URI, URL}
 import java.nio.charset.StandardCharsets
 import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
 import scala.jdk.CollectionConverters._
@@ -44,11 +43,13 @@ object ClientMetadataError {
  *    endless response occupies one request slot briefly instead of a thread
  *    forever.
  *
- * Checking the address and then connecting is a time-of-check/time-of-use gap
- * in principle: DNS can change between the two. Closing it properly needs a
- * socket-level hook that `HttpURLConnection` does not offer, so the address of
- * the established connection is verified again after connecting, which closes
- * it in practice for the JDK client.
+ * Checking the address and then connecting to a *name* closes nothing: the two
+ * resolutions are independent, and only the second one decides where the
+ * request goes. Verifying afterwards is worse than useless, because a response
+ * exists only once the request has been sent. So the address is chosen here
+ * and the socket is connected to exactly it; see `PinnedConnection`. The host
+ * name is still what TLS asks for and what the certificate must match, so
+ * nothing about authenticating the peer is given up.
  */
 object ClientMetadata {
 
@@ -95,96 +96,101 @@ object ClientMetadata {
   def isForbiddenAddress(addr: InetAddress): Boolean =
     isForbiddenAddress(addr, allowLoopback = false)
 
-  def isForbiddenAddress(addr: InetAddress, allowLoopback: Boolean): Boolean =
-    (addr.isLoopbackAddress && !allowLoopback) || addr.isLinkLocalAddress || addr.isSiteLocalAddress ||
-      addr.isAnyLocalAddress || addr.isMulticastAddress ||
+  def isForbiddenAddress(addr: InetAddress, allowLoopback: Boolean): Boolean = {
+    val bytes = addr.getAddress
+    def octet(i: Int): Int = bytes(i) & 0xff
+
+    // An IPv4 address written as an IPv6 one is the same destination, and
+    // `isSiteLocalAddress` and friends do not look through the wrapper. Both
+    // the mapped (::ffff:a.b.c.d) and compatible (::a.b.c.d) forms unwrap.
+    val embeddedIPv4: Option[InetAddress] =
+      if (bytes.length == 16 && (0 until 10).forall(bytes(_) == 0) &&
+          ((octet(10) == 0xff && octet(11) == 0xff) || (octet(10) == 0 && octet(11) == 0)) &&
+          !(0 until 12).forall(bytes(_) == 0))
+        try Some(InetAddress.getByAddress(bytes.slice(12, 16))) catch { case _: Exception => None }
+      else None
+
+    embeddedIPv4.exists(isForbiddenAddress(_, allowLoopback)) ||
+      (addr.isLoopbackAddress && !allowLoopback) || addr.isLinkLocalAddress ||
+      addr.isSiteLocalAddress || addr.isAnyLocalAddress || addr.isMulticastAddress ||
       // 100.64.0.0/10, carrier-grade NAT, not covered by isSiteLocalAddress.
-      (addr.getAddress.length == 4 &&
-        (addr.getAddress()(0) & 0xff) == 100 &&
-        ((addr.getAddress()(1) & 0xff) >= 64) && ((addr.getAddress()(1) & 0xff) <= 127))
+      (bytes.length == 4 && octet(0) == 100 && octet(1) >= 64 && octet(1) <= 127) ||
+      // fc00::/7, IPv6 unique local. `isSiteLocalAddress` only covers the
+      // deprecated fec0::/10, so without this a ULA address reads as public.
+      (bytes.length == 16 && (octet(0) & 0xfe) == 0xfc)
+  }
 
   /** How a host name becomes addresses; injectable so the policy is testable. */
   type Resolver = String => Array[InetAddress]
 
   val systemResolver: Resolver = InetAddress.getAllByName
 
-  private def checkHost(host: String, resolve: Resolver,
-                        allowLoopback: Boolean): Either[ClientMetadataError, Unit] =
+  /**
+   * Resolve `host` and return the one address the request may go to.
+   *
+   * Returning the address, rather than a verdict about the name, is the point:
+   * the caller connects to this and to nothing else, so there is no second
+   * resolution for an attacker to answer differently.
+   */
+  private[oauth] def permittedAddress(host: String, resolve: Resolver,
+                                      allowLoopback: Boolean): Either[ClientMetadataError, InetAddress] =
     try {
       val addresses = resolve(host)
-      if (addresses.isEmpty) Left(ClientMetadataError.Unreachable(s"cannot resolve $host"))
+      if (addresses == null || addresses.isEmpty)
+        Left(ClientMetadataError.Unreachable(s"cannot resolve $host"))
       // Every address, not the first: a host that resolves to one public and
       // one private address must not be reachable by retry.
       else if (addresses.exists(isForbiddenAddress(_, allowLoopback)))
         Left(ClientMetadataError.Rejected(s"$host resolves to a non-public address"))
-      else Right(())
+      else Right(addresses.head)
     } catch {
       case _: Exception => Left(ClientMetadataError.Unreachable(s"cannot resolve $host"))
     }
 
   /**
+   * How a validated address becomes a response.
+   *
+   * The address is a parameter rather than something the fetcher works out for
+   * itself, so the destination cannot drift between the check and the request.
+   * Injectable so a control can see which address the production path dialled.
+   */
+  type Fetcher = (URL, InetAddress) => PinnedResponse
+
+  val pinnedFetcher: Fetcher = (url, address) =>
+    PinnedConnection.fetch(url, address, ConnectTimeoutMs, ReadTimeoutMs, MaxBytes)
+
+  /**
    * Fetch and parse a client metadata document.
    *
-   * `open` is injectable so the fetch policy can be tested without a network:
-   * the SSRF rules are enforced before it is called, and the byte cap after.
+   * The address is resolved and checked once, and the connection is pinned to
+   * it. There is no second resolution and no after-the-fact verification: by
+   * the time a response exists the request has already been made, which is the
+   * part that mattered.
    */
   def fetch(mapper: ObjectMapper, clientId: String,
-            open: URL => HttpURLConnection = defaultOpen,
+            open: Fetcher = pinnedFetcher,
             resolve: Resolver = systemResolver,
             allowLoopback: Boolean = loopbackAllowed()): Either[ClientMetadataError, OAuthClient] =
     for {
       uri <- validateClientId(clientId)
-      _ <- checkHost(uri.getHost, resolve, allowLoopback)
-      body <- read(uri.toURL, open, resolve, allowLoopback)
+      address <- permittedAddress(uri.getHost, resolve, allowLoopback)
+      body <- read(uri.toURL, address, open)
       client <- parse(mapper, clientId, body)
     } yield client
 
-  private def read(url: URL, open: URL => HttpURLConnection,
-                   resolve: Resolver, allowLoopback: Boolean): Either[ClientMetadataError, String] = {
-    var conn: HttpURLConnection = null
+  private def read(url: URL, address: InetAddress,
+                   open: Fetcher): Either[ClientMetadataError, String] =
     try {
-      conn = open(url)
-      conn.setRequestMethod("GET")
-      conn.setConnectTimeout(ConnectTimeoutMs)
-      conn.setReadTimeout(ReadTimeoutMs)
-      conn.setInstanceFollowRedirects(false)
-      conn.setRequestProperty("Accept", "application/json")
-      val status = conn.getResponseCode
-      if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308)
+      val response = open(url, address)
+      if (response.status >= 300 && response.status < 400)
         Left(ClientMetadataError.Rejected("client metadata must not redirect"))
-      else if (status != 200)
-        Left(ClientMetadataError.Unreachable(s"client metadata returned HTTP $status"))
-      else {
-        // The connection is established here, so this is the address actually
-        // used rather than the one resolved a moment ago.
-        val connected = Option(conn.getURL).map(_.getHost).getOrElse("")
-        checkHost(connected, resolve, allowLoopback) match {
-          case Left(e) => Left(e)
-          case Right(_) => Right(readCapped(conn.getInputStream))
-        }
-      }
+      else if (response.status != 200)
+        Left(ClientMetadataError.Unreachable(s"client metadata returned HTTP ${response.status}"))
+      else Right(response.body)
     } catch {
       case e: Exception => Left(ClientMetadataError.Unreachable(
         s"client metadata could not be fetched: ${e.getClass.getSimpleName}"))
-    } finally if (conn != null) conn.disconnect()
-  }
-
-  private def readCapped(in: InputStream): String = {
-    val buffered = new BufferedInputStream(in)
-    try {
-      val out = new java.io.ByteArrayOutputStream()
-      val buf = new Array[Byte](8192)
-      var total = 0
-      var n = buffered.read(buf)
-      while (n >= 0 && total < MaxBytes) {
-        val take = math.min(n, MaxBytes - total)
-        out.write(buf, 0, take)
-        total += take
-        n = buffered.read(buf)
-      }
-      new String(out.toByteArray, StandardCharsets.UTF_8)
-    } finally buffered.close()
-  }
+    }
 
   def parse(mapper: ObjectMapper, clientId: String, body: String): Either[ClientMetadataError, OAuthClient] =
     try {
@@ -220,6 +226,4 @@ object ClientMetadata {
   private def isLoopbackHost(host: String): Boolean =
     host != null && (host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1")
 
-  private def defaultOpen(url: URL): HttpURLConnection =
-    url.openConnection().asInstanceOf[HttpURLConnection]
 }

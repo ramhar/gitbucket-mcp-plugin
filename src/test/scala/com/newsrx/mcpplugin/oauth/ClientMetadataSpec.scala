@@ -1,7 +1,7 @@
 package com.newsrx.mcpplugin.oauth
 
 import com.fasterxml.jackson.databind.ObjectMapper
-import java.net.{HttpURLConnection, InetAddress, URL}
+import java.net.{InetAddress, URL}
 import org.junit.runner.RunWith
 import org.scalatestplus.junit.JUnitRunner
 import org.scalatest.funsuite.AnyFunSuite
@@ -79,20 +79,20 @@ class ClientMetadataSpec extends AnyFunSuite with Matchers {
     var opened = false
     val mixed: ClientMetadata.Resolver = (_: String) =>
       Array(InetAddress.getByName("93.184.216.34"), InetAddress.getByName("10.0.0.5"))
-    ClientMetadata.fetch(mapper, clientId, (_: URL) => { opened = true; null }, mixed).isLeft shouldBe true
+    ClientMetadata.fetch(mapper, clientId, (_: URL, _: InetAddress) => { opened = true; null }, mixed).isLeft shouldBe true
     opened shouldBe false
   }
 
   test("a fetch succeeds through the real path when every rule is satisfied") {
     val body = s"""{"client_id":"$clientId","client_name":"Example","redirect_uris":["https://a.example.com/cb"]}"""
-    ClientMetadata.fetch(mapper, clientId, (_: URL) => stub(200, body), publicHost)
+    ClientMetadata.fetch(mapper, clientId, (_: URL, _: InetAddress) => stub(200, body), publicHost)
       .map(_.clientName) shouldBe Right("Example")
   }
 
   test("a client id resolving to a forbidden address is refused before any request") {
     var opened = false
     val result = ClientMetadata.fetch(mapper, clientId,
-      (_: URL) => { opened = true; null }, resolvesTo("127.0.0.1"))
+      (_: URL, _: InetAddress) => { opened = true; null }, resolvesTo("127.0.0.1"))
     result shouldBe Left(ClientMetadataError.Rejected(
       "client.example.com resolves to a non-public address"))
     withClue("the fetcher must refuse before opening a connection: ")(opened shouldBe false)
@@ -101,7 +101,7 @@ class ClientMetadataSpec extends AnyFunSuite with Matchers {
   test("a redirect is refused rather than followed") {
     // The classic bypass: an allowed host answers 302 to a forbidden one.
     Seq(301, 302, 303, 307, 308).foreach { status =>
-      val result = ClientMetadata.fetch(mapper, clientId, (_: URL) => stub(status, ""), publicHost)
+      val result = ClientMetadata.fetch(mapper, clientId, (_: URL, _: InetAddress) => stub(status, ""), publicHost)
       withClue(s"$status: ") {
         result shouldBe Left(ClientMetadataError.Rejected("client metadata must not redirect"))
       }
@@ -109,15 +109,15 @@ class ClientMetadataSpec extends AnyFunSuite with Matchers {
   }
 
   test("a non-200 response is reported as unreachable, not parsed") {
-    ClientMetadata.fetch(mapper, clientId, (_: URL) => stub(404, "{}"), publicHost).isLeft shouldBe true
-    ClientMetadata.fetch(mapper, clientId, (_: URL) => stub(500, "{}"), publicHost).isLeft shouldBe true
+    ClientMetadata.fetch(mapper, clientId, (_: URL, _: InetAddress) => stub(404, "{}"), publicHost).isLeft shouldBe true
+    ClientMetadata.fetch(mapper, clientId, (_: URL, _: InetAddress) => stub(500, "{}"), publicHost).isLeft shouldBe true
   }
 
   test("the response body is capped, so an endless document cannot be read forever") {
     val huge = """{"client_id":"""" + clientId + """","redirect_uris":["https://a.example.com/cb"],"pad":"""" +
       ("x" * (300 * 1024)) + """"}"""
     // Truncated at the cap, so it no longer parses: refused, not consumed.
-    val result = ClientMetadata.fetch(mapper, clientId, (_: URL) => stub(200, huge), publicHost)
+    val result = ClientMetadata.fetch(mapper, clientId, (_: URL, _: InetAddress) => stub(200, huge), publicHost)
     result.isLeft shouldBe true
   }
 
@@ -244,18 +244,8 @@ class ClientMetadataSpec extends AnyFunSuite with Matchers {
     html should include(clientId)
   }
 
-  private def stub(status: Int, body: String): HttpURLConnection =
-    new HttpURLConnection(new URL("https://client.example.com/.well-known/mcp-client")) {
-      override def connect(): Unit = ()
-      override def disconnect(): Unit = ()
-      override def usingProxy(): Boolean = false
-      override def getResponseCode: Int = status
-      override def getInputStream: java.io.InputStream =
-        new java.io.ByteArrayInputStream(body.getBytes("UTF-8"))
-      override def setRequestMethod(m: String): Unit = ()
-      override def setConnectTimeout(t: Int): Unit = ()
-      override def setReadTimeout(t: Int): Unit = ()
-      override def setInstanceFollowRedirects(b: Boolean): Unit = ()
-      override def setRequestProperty(k: String, v: String): Unit = ()
-    }
+  // The body is capped by the transport, so a stub that hands back more than
+  // the cap is standing in for a transport that already truncated.
+  private def stub(status: Int, body: String): PinnedResponse =
+    PinnedResponse(status, body.take(64 * 1024))
 }
