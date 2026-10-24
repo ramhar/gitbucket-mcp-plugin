@@ -199,6 +199,95 @@ class OAuthStoreSpec extends AnyFunSuite with Matchers {
 
   // ── concurrency ───────────────────────────────────────────────────────────
 
+  // ── a binding failure must not inherit revocation authority ───────────────
+  //
+  // Revoking on replay is only defensible for a presentation that could have
+  // come from the legitimate client. Checking `consumed` before the bindings
+  // handed that authority to anyone holding a spent code: a wrong client id,
+  // redirect, resource or verifier each reached the revocation and ended a
+  // live session. Possession of a spent code is not evidence.
+
+  private def consumedCodeFixture(conn: Connection): (String, String, String) = {
+    val grantId = seedGrant(conn)
+    val code = OAuthStore.issueCode(conn, grantId, challenge, redirect, later)
+    OAuthStore.redeemCode(conn, code, clientId, redirect, Some(resource), verifier, now)
+      .isRight shouldBe true
+    val access = OAuthStore.issueAccessToken(conn, grantId, now.plusSeconds(3600), now)
+    OAuthStore.resolveAccessToken(conn, access, now).isRight shouldBe true
+    (grantId, code, access)
+  }
+
+  test("a wrong client on a spent code is refused without revoking the grant") {
+    withDb { conn =>
+      val (grantId, code, access) = consumedCodeFixture(conn)
+      OAuthStore.redeemCode(conn, code, "https://evil.example.com/meta", redirect,
+        Some(resource), verifier, now) shouldBe Left(GrantFailure.ClientMismatch)
+      OAuthStore.findGrant(conn, grantId) should not be empty
+      OAuthStore.resolveAccessToken(conn, access, now).isRight shouldBe true
+    }
+  }
+
+  test("a wrong redirect on a spent code is refused without revoking the grant") {
+    withDb { conn =>
+      val (grantId, code, access) = consumedCodeFixture(conn)
+      OAuthStore.redeemCode(conn, code, clientId, "https://evil.example.com/cb",
+        Some(resource), verifier, now) shouldBe Left(GrantFailure.RedirectMismatch)
+      OAuthStore.findGrant(conn, grantId) should not be empty
+      OAuthStore.resolveAccessToken(conn, access, now).isRight shouldBe true
+    }
+  }
+
+  test("a wrong resource on a spent code is refused without revoking the grant") {
+    withDb { conn =>
+      val (grantId, code, access) = consumedCodeFixture(conn)
+      OAuthStore.redeemCode(conn, code, clientId, redirect,
+        Some("https://other.example.com/plugin-mcp/"), verifier, now) shouldBe
+        Left(GrantFailure.ResourceMismatch)
+      OAuthStore.findGrant(conn, grantId) should not be empty
+      OAuthStore.resolveAccessToken(conn, access, now).isRight shouldBe true
+    }
+  }
+
+  test("a wrong verifier on a spent code is refused without revoking the grant") {
+    // The sharpest case: an attacker who captured the code but not the
+    // verifier previously got to destroy the session anyway.
+    withDb { conn =>
+      val (grantId, code, access) = consumedCodeFixture(conn)
+      OAuthStore.redeemCode(conn, code, clientId, redirect, Some(resource),
+        "b" * 64, now) shouldBe Left(GrantFailure.PkceFailed)
+      OAuthStore.findGrant(conn, grantId) should not be empty
+      OAuthStore.resolveAccessToken(conn, access, now).isRight shouldBe true
+    }
+  }
+
+  test("a correctly bound replay still revokes, after all those refusals") {
+    // The policy is intact, not merely harder to reach: the same fixture,
+    // presented correctly, still ends the grant.
+    withDb { conn =>
+      val (grantId, code, access) = consumedCodeFixture(conn)
+      OAuthStore.redeemCode(conn, code, "https://evil.example.com/meta", redirect,
+        Some(resource), verifier, now).isLeft shouldBe true
+      OAuthStore.redeemCode(conn, code, clientId, redirect, Some(resource), verifier, now) shouldBe
+        Left(GrantFailure.AlreadyUsed)
+      OAuthStore.findGrant(conn, grantId) shouldBe None
+      OAuthStore.resolveAccessToken(conn, access, now) shouldBe Left(GrantFailure.Revoked)
+    }
+  }
+
+  test("an expired code is refused without revoking, even presented twice") {
+    withDb { conn =>
+      val grantId = seedGrant(conn)
+      val code = OAuthStore.issueCode(conn, grantId, challenge, redirect, now.plusSeconds(60))
+      val after = now.plusSeconds(120)
+      OAuthStore.redeemCode(conn, code, clientId, redirect, Some(resource), verifier, after) shouldBe
+        Left(GrantFailure.Expired)
+      OAuthStore.redeemCode(conn, code, clientId, redirect, Some(resource), verifier, after) shouldBe
+        Left(GrantFailure.Expired)
+      withClue("expiry is not evidence of theft: ")(
+        OAuthStore.findGrant(conn, grantId) should not be empty)
+    }
+  }
+
   test("two simultaneous redemptions of one code produce exactly one grant") {
     val url = freshDb()
     val setup = DriverManager.getConnection(url)
@@ -220,6 +309,16 @@ class OAuthStoreSpec extends AnyFunSuite with Matchers {
         results.count(_.isRight) shouldBe 1
         results.count(_ == Left(GrantFailure.AlreadyUsed)) shouldBe 1
       }
+      // The loser was correctly bound, so losing the claim is the same
+      // situation as an outright replay and gets the same documented policy.
+      // It used to return AlreadyUsed and leave the grant alive, which meant
+      // a race quietly bypassed reuse detection.
+      val check = DriverManager.getConnection(url)
+      try {
+        val grantId = results.collectFirst { case Right(g) => g.grantId }.get
+        withClue("the committed grant after a lost claim: ")(
+          OAuthStore.findGrant(check, grantId) shouldBe None)
+      } finally check.close()
     } finally pool.shutdownNow()
   }
 
@@ -320,6 +419,89 @@ class OAuthStoreSpec extends AnyFunSuite with Matchers {
       OAuthStore.resolveAccessToken(conn, access, now) shouldBe Left(GrantFailure.Revoked)
       OAuthStore.rotateRefreshToken(conn, successor, clientId, now.plusSeconds(3600), now)
         .isRight shouldBe false
+    }
+  }
+
+  // ── a dead credential is not evidence ────────────────────────────────────
+  //
+  // A superseded refresh token whose own expiry has passed used to be read as
+  // a replay, revoking the family. So an old token — useless to whoever held
+  // it — could still destroy the successor the legitimate client was using.
+
+  /** A rotated-away token, its successor, and an access token on the grant. */
+  private def supersededFixture(conn: Connection, firstExpiry: Instant) = {
+    val grantId = seedGrant(conn)
+    val first = OAuthStore.setRefreshToken(conn, grantId, firstExpiry, now)
+    val Right((_, successor)) =
+      OAuthStore.rotateRefreshToken(conn, first, clientId, now.plusSeconds(7200), now)
+    val access = OAuthStore.issueAccessToken(conn, grantId, now.plusSeconds(7200), now)
+    (grantId, first, successor, access)
+  }
+
+  test("a superseded token replayed just before its expiry still revokes") {
+    withDb { conn =>
+      val expiry = now.plusSeconds(600)
+      val (grantId, first, successor, access) = supersededFixture(conn, expiry)
+      val justBefore = expiry.minusSeconds(1)
+      OAuthStore.rotateRefreshToken(conn, first, clientId, justBefore.plusSeconds(3600), justBefore) shouldBe
+        Left(GrantFailure.AlreadyUsed)
+      OAuthStore.findGrant(conn, grantId) shouldBe None
+      OAuthStore.resolveAccessToken(conn, access, justBefore) shouldBe Left(GrantFailure.Revoked)
+      OAuthStore.rotateRefreshToken(conn, successor, clientId,
+        justBefore.plusSeconds(3600), justBefore).isRight shouldBe false
+    }
+  }
+
+  test("a superseded token replayed exactly at its expiry does not revoke") {
+    withDb { conn =>
+      val expiry = now.plusSeconds(600)
+      val (grantId, first, _, access) = supersededFixture(conn, expiry)
+      OAuthStore.rotateRefreshToken(conn, first, clientId, expiry.plusSeconds(3600), expiry) shouldBe
+        Left(GrantFailure.Expired)
+      OAuthStore.findGrant(conn, grantId) should not be empty
+      OAuthStore.resolveAccessToken(conn, access, expiry).isRight shouldBe true
+    }
+  }
+
+  test("a superseded token replayed after its expiry does not destroy the successor") {
+    withDb { conn =>
+      val expiry = now.plusSeconds(600)
+      val (grantId, first, successor, access) = supersededFixture(conn, expiry)
+      val after = expiry.plusSeconds(60)
+      OAuthStore.rotateRefreshToken(conn, first, clientId, after.plusSeconds(3600), after) shouldBe
+        Left(GrantFailure.Expired)
+      withClue("the grant survives: ")(OAuthStore.findGrant(conn, grantId) should not be empty)
+      withClue("the access token survives: ")(
+        OAuthStore.resolveAccessToken(conn, access, after).isRight shouldBe true)
+      withClue("and the lawful successor still rotates: ")(
+        OAuthStore.rotateRefreshToken(conn, successor, clientId,
+          after.plusSeconds(3600), after).isRight shouldBe true)
+    }
+  }
+
+  test("a wrong client on an expired superseded token changes nothing") {
+    withDb { conn =>
+      val expiry = now.plusSeconds(600)
+      val (grantId, first, successor, _) = supersededFixture(conn, expiry)
+      val after = expiry.plusSeconds(60)
+      OAuthStore.rotateRefreshToken(conn, first, "https://evil.example.com/meta",
+        after.plusSeconds(3600), after) shouldBe Left(GrantFailure.ClientMismatch)
+      OAuthStore.findGrant(conn, grantId) should not be empty
+      OAuthStore.rotateRefreshToken(conn, successor, clientId,
+        after.plusSeconds(3600), after).isRight shouldBe true
+    }
+  }
+
+  test("cleanup keeps the rows replay detection still needs") {
+    // Purging removes credentials that are already dead of old age. An
+    // unexpired superseded row is not one of those: deleting it would turn a
+    // detectable replay into an unknown token.
+    withDb { conn =>
+      val (grantId, first, _, _) = supersededFixture(conn, now.plusSeconds(600))
+      OAuthStore.purgeExpired(conn, now.plusSeconds(60))
+      OAuthStore.rotateRefreshToken(conn, first, clientId,
+        now.plusSeconds(3660), now.plusSeconds(60)) shouldBe Left(GrantFailure.AlreadyUsed)
+      OAuthStore.findGrant(conn, grantId) shouldBe None
     }
   }
 

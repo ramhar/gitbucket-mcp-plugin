@@ -177,24 +177,60 @@ object OAuthStore {
       case None => Left(GrantFailure.NotFound)
       case Some((grantId, challenge, storedRedirect, expiresAt, consumed, userName, grantClient,
                  grantResource, scopes, revoked)) =>
+        // Bindings first, and before anything is written.
+        //
+        // Revoking on a replay only makes sense for a presentation that could
+        // have come from the legitimate client. Checking `consumed` first gave
+        // that authority to anyone holding the code: a wrong client id, a
+        // wrong redirect, a wrong resource or a wrong PKCE verifier all
+        // reached the revocation and destroyed a live grant. Possession of a
+        // spent code is not evidence, and an unauthenticated caller must not
+        // be able to end someone's session with it.
         if (revoked) Left(GrantFailure.Revoked)
-        else if (consumed) {
-          // A replayed code means the first one may have been stolen. RFC 6749
-          // §10.5 and the OAuth 2.1 guidance both say to revoke what it bought.
-          revokeGrant(conn, grantId, now)
-          Left(GrantFailure.AlreadyUsed)
-        }
-        else if (!expiresAt.isAfter(now)) Left(GrantFailure.Expired)
         else if (!Secrets.constantTimeEquals(clientId, grantClient)) Left(GrantFailure.ClientMismatch)
         else if (!Secrets.constantTimeEquals(redirectUri, storedRedirect)) Left(GrantFailure.RedirectMismatch)
         else if (resource.exists(r => !Secrets.constantTimeEquals(r, grantResource)))
           Left(GrantFailure.ResourceMismatch)
         else if (!Pkce.verify(codeVerifier, challenge)) Left(GrantFailure.PkceFailed)
-        else if (!consumeCode(conn, hash, now)) Left(GrantFailure.AlreadyUsed)
-        else Right(ResolvedGrant(grantId, userName, grantClient, grantResource,
-          McpScope.parseRequested(scopes)))
+        // Expiry is not a replay. An expired code buys nothing, but it is also
+        // not evidence that anything was stolen, so it does not revoke.
+        else if (!expiresAt.isAfter(now)) Left(GrantFailure.Expired)
+        else if (consumed) replayed(conn, grantId, now)
+        else if (consumeCode(conn, hash, now))
+          Right(ResolvedGrant(grantId, userName, grantClient, grantResource,
+            McpScope.parseRequested(scopes)))
+        // The claim was lost. Everything above says this presentation was
+        // correctly bound, so whatever took the code did so in a race with a
+        // request that could have been the legitimate one — the same
+        // situation as an outright replay, and it gets the same policy. The
+        // row is re-read rather than assumed, so a claim that failed for
+        // another reason is not reported as a replay.
+        else classifyLostClaim(conn, hash, grantId, now)
     }
   }
+
+  /** The documented reuse policy: the family goes, and the caller is told. */
+  private def replayed(conn: Connection, grantId: String,
+                       now: Instant): Either[GrantFailure, ResolvedGrant] = {
+    // RFC 6749 §10.5 and the OAuth 2.1 guidance: a code presented twice may
+    // have been stolen, so what it bought is withdrawn.
+    revokeGrant(conn, grantId, now)
+    Left(GrantFailure.AlreadyUsed)
+  }
+
+  /** Why did the conditional claim match no row? */
+  private def classifyLostClaim(conn: Connection, codeHash: String, grantId: String,
+                                now: Instant): Either[GrantFailure, ResolvedGrant] =
+    using(conn.prepareStatement(
+      "SELECT CONSUMED, EXPIRES_AT FROM MCP_OAUTH_CODE WHERE CODE_HASH = ?")) { st =>
+      st.setString(1, codeHash)
+      using(st.executeQuery()) { rs =>
+        if (!rs.next()) Left(GrantFailure.NotFound)
+        else if (rs.getBoolean(1)) replayed(conn, grantId, now)
+        else if (!rs.getTimestamp(2).toInstant.isAfter(now)) Left(GrantFailure.Expired)
+        else Left(GrantFailure.NotFound)
+      }
+    }
 
   /** The atomic step: true for exactly one caller. */
   private def consumeCode(conn: Connection, codeHash: String, now: Instant): Boolean =
@@ -300,7 +336,7 @@ object OAuthStore {
     // still using. Only a correctly bound presentation moves the chain.
     val binding = refreshRow(conn, presentedHash) match {
       case None => Left(GrantFailure.NotFound)
-      case Some((grantId, _)) =>
+      case Some((grantId, _, _)) =>
         findGrant(conn, grantId) match {
           case None => Left(GrantFailure.Revoked)
           case Some(grant) if !Secrets.constantTimeEquals(clientId, grant.clientId) =>
@@ -331,14 +367,22 @@ object OAuthStore {
         // look like an expiry. That gap made the concurrency control
         // intermittently disagree with itself, which is how it was found.
         refreshRow(conn, presentedHash) match {
-          // Present but not rotatable: already used, or expired. A replay
-          // ends the grant; an expiry does not, because it is the client
-          // being slow rather than a credential being somewhere it should
-          // not be.
-          case Some((id, true)) =>
-            revokeGrant(conn, id, now)
-            Left(GrantFailure.AlreadyUsed)
-          case Some((_, false)) => Left(GrantFailure.Expired)
+          // Present but not rotatable: spent, expired, or both. A replay ends
+          // the grant; an expiry does not, because it is the client being slow
+          // rather than a credential being somewhere it should not be.
+          //
+          // Both at once is the case that was wrong. A superseded token whose
+          // own expiry has since passed was treated as a replay and revoked
+          // the family — so an old token, useless to whoever held it, could
+          // still destroy the successor the legitimate client was using. Its
+          // expiry is checked first: once a credential is dead of old age,
+          // presenting it is not evidence of anything.
+          case Some((id, rotated, expires)) =>
+            if (!expires.isAfter(now)) Left(GrantFailure.Expired)
+            else if (rotated) {
+              revokeGrant(conn, id, now)
+              Left(GrantFailure.AlreadyUsed)
+            } else Left(GrantFailure.NotFound)
           case None => Left(GrantFailure.NotFound)
         }
       }
@@ -346,10 +390,14 @@ object OAuthStore {
   }
 
   /** The grant a refresh token belongs to, and whether it has been rotated. */
-  private def refreshRow(conn: Connection, hash: String): Option[(String, Boolean)] =
-    using(conn.prepareStatement("SELECT GRANT_ID, ROTATED FROM MCP_OAUTH_REFRESH WHERE TOKEN_HASH = ?")) { st =>
+  /** The grant a refresh row belongs to, whether it is spent, and when it dies. */
+  private def refreshRow(conn: Connection, hash: String): Option[(String, Boolean, Instant)] =
+    using(conn.prepareStatement(
+      "SELECT GRANT_ID, ROTATED, EXPIRES_AT FROM MCP_OAUTH_REFRESH WHERE TOKEN_HASH = ?")) { st =>
       st.setString(1, hash)
-      using(st.executeQuery())(rs => if (rs.next()) Some((rs.getString(1), rs.getBoolean(2))) else None)
+      using(st.executeQuery())(rs =>
+        if (rs.next()) Some((rs.getString(1), rs.getBoolean(2), rs.getTimestamp(3).toInstant))
+        else None)
     }
 
   private def refreshGrantId(conn: Connection, hash: String): Option[String] =
