@@ -45,6 +45,32 @@ Use `localhost` for the browser part and `127.0.0.1` for the REST control
 calls, as the files do: the consent form's action is built from the
 configured base URL, so the session cookie has to live on that host name.
 
+`oauth_gate.py` holds the flow helpers — a local HTTP server that publishes
+client metadata documents, PKCE, a non-following HTTP client so redirects are
+inspected rather than followed, and the walk through the real consent screen.
+`oauth_controls.py` holds the controls themselves.
+
+## The audience binding
+
+`resource_gate.py` checks the one property that only a restart can show: a
+grant issued while the server calls itself one resource, presented again after
+the same server restarts as another. It starts and stops its own processes,
+like the upgrade gate.
+
+```sh
+python3 itest/resource_gate.py \
+  --war gitbucket.war \
+  --candidate build/libs/gitbucket-mcp-plugin-*.jar \
+  --home /tmp/gb-resource
+```
+
+It then restores the original configuration and checks that the refused
+credentials work again, so that a refusal is established to be a refusal
+rather than a quiet destruction. Each refusal must arrive as the exact
+status and error code RFC 6749 §5.2 entitles that scenario to — `(400,
+invalid_grant)` at both observation points. A refusal of some other kind is a
+refusal of something else, and the gate aborts rather than counting it.
+
 ## Installation and upgrade
 
 `upgrade_gate.py` is different from the two above: it starts and stops its own
@@ -81,11 +107,6 @@ a real fork, so a correct zero is distinguishable from an unpopulated field.
 python3 itest/repo_list_gate.py
 ```
 
-`oauth_gate.py` holds the flow helpers — a local HTTP server that publishes
-client metadata documents, PKCE, a non-following HTTP client so redirects are
-inspected rather than followed, and the walk through the real consent screen.
-`oauth_controls.py` holds the controls themselves.
-
 Committed effects are observed by asking again rather than by reading the
 tables. After a refusal that must change nothing, the lawful operation is
 performed next and has to succeed; after a replay that must revoke, a fresh
@@ -100,7 +121,12 @@ directory from `tempfile.mkdtemp()`, which it removes on exit. Exit codes:
 | --- | --- |
 | 0 | every check ran and passed |
 | 1 | a check failed |
-| 2 | **the gate could not be run** — a precondition failed, a comparison lost its input, or fewer than 200 checks executed. No result may be read from the run. |
+| 2 | **the gate could not be run** — a precondition failed, a comparison lost its input, or fewer checks executed than that gate's floor. No result may be read from the run. |
+
+Each gate carries its own floor, declared in its own source rather than here:
+`integration.py` 200, `repo_list_gate.py` 35, `upgrade_gate.py` 22,
+`resource_gate.py` 15. A run that falls below one is exit 2, not a smaller
+pass.
 
 `BASE` and the account passwords are at the top of `mcp.py`. They are
 throwaway credentials for a throwaway instance; do not reuse them anywhere.
@@ -132,16 +158,22 @@ reports nothing at all. So:
 - timestamps go through `checks.require_iso_utc` and `checks.same_instant`,
   which compare the moment against GitBucket's own value instead of checking
   that a string is non-empty;
-- the run aborts if fewer than 200 checks executed.
+- the run aborts if fewer checks executed than the gate's declared floor.
 
 ### Proving the guards fire
 
-`python3 itest/selftest.py` runs 63 negative controls against those guards,
-with no server and no network. Each asserts that a guard **raises** on the
+`python3 itest/selftest.py` drives those guards with no server and no network,
+and prints its own total — deliberately not repeated here, because a number
+written in prose is wrong the next time a control is added.
+
+Most of its controls are negative: each asserts that a guard **raises** on the
 input that used to be tolerated — an empty gateway list, a 500 from
 GitBucket's own route, a failed collaborator addition, a `Date.toString`
-timestamp, an unreadable stored-issue count — and that it does not raise on a
-legitimate one.
+timestamp, an unreadable stored-issue count, a token-endpoint refusal that is
+documented but is not the one the scenario is entitled to. The rest are
+lawful twins, which assert the same guard does **not** raise on a legitimate
+input. The twins are not padding: a guard that rejects everything passes every
+negative control there is, and only a twin notices.
 
 Two of the bypasses were at the *call site* rather than in the helper, so these
 controls drive the real code path with API doubles instead of testing a helper

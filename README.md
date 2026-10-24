@@ -173,18 +173,30 @@ needs only the server URL. It reads
 `/.well-known/oauth-protected-resource`, follows it to the authorization server
 metadata, registers itself by publishing a client ID metadata document (no
 pre-registration with this server, and no client secret), and sends you to
-GitBucket's own sign-in and then to a consent screen. You choose read-only or
-read and write; the token it receives acts as your account and can do nothing
-your account cannot.
+GitBucket's own sign-in and then to a consent screen.
+
+The **client** chooses which scopes to ask for. The consent screen lists
+exactly those and offers one decision — Authorize or Cancel; there is no
+per-scope selector, so a client that asks for `mcp:write` is approved or
+refused as a whole. A client that asks for nothing is granted the weaker
+scope, `mcp:read`. What is granted is the set the server recorded when the
+request arrived, not a field posted back with the form. Either way the token
+acts as your account and can do nothing your account cannot.
 
 This requires `gitbucket.mcp.oauth.baseUrl` and a GitBucket the client can
-reach over HTTPS. Testing so far has been against the protocol rather than
-against a particular product's client: the flow is exercised end to end by
-`itest/oauth_controls.py` over real HTTP, which is not the same as having
-connected a given commercial client. [docs/authentication.md](docs/authentication.md)
-says exactly what has and has not been tried.
+reach over HTTPS. The flow is exercised end to end by
+`itest/oauth_controls.py` over real HTTP, and a commercial client — ChatGPT's
+connector — has since completed it against a running GitBucket and made
+authenticated calls through it.
+[docs/authentication.md](docs/authentication.md) says exactly which operations
+were observed, against which build, and what that does and does not
+establish.
 
 ### Manual testing with curl
+
+`root:root` below is GitBucket's own default administrator on a **fresh local
+instance**, which is what these examples assume. Substitute your own account,
+and never point these at an instance that holds anything real.
 
 ```bash
 # List all tools
@@ -244,10 +256,13 @@ outside the table above has not been run.
 ./gradlew test
 ```
 
-240 tests covering JSON-RPC protocol parsing, the tool registry, schema
-validation, argument parsing, repository authorization, the OAuth grant store
-against a real database created by the plugin's own migration, and the client
-metadata fetcher's SSRF policy.
+Covers JSON-RPC protocol parsing, the tool registry, schema validation,
+argument parsing, repository authorization, tool execution through the
+production dispatcher, the OAuth grant store against a real database created
+by the plugin's own migration, the client metadata fetcher's SSRF policy and
+its HTTP framing bounds. The run prints its own total; this page deliberately
+does not restate it, because a number written here is wrong the next time a
+test is added.
 
 ### Integration tests
 

@@ -260,6 +260,19 @@ forgets to declare does not compile rather than defaulting to the weaker
 requirement. A read grant cannot mutate: the scope check happens before the
 tool runs, and the repository guard still happens inside it.
 
+**Who decides which scopes are asked for.** The client does, in its
+authorization request. The consent screen lists exactly the scopes that
+request named, and offers one decision over the set — Authorize or Cancel.
+There is no per-scope selector, so a client asking for `mcp:write` is approved
+or refused as a whole; a user who wants a read-only connection refuses and
+the client asks for less. A request naming no scope at all is treated as
+asking for the weaker one, `mcp:read`.
+
+What is granted is the set the server recorded when the request arrived, held
+in the user's own session, not the value posted back with the consent form.
+That record is removed on any decision, allow or deny, so a resubmitted form
+cannot mint a second code.
+
 OIDC scopes (`openid`, `email`, `profile`) and a UserInfo endpoint are **not**
 implemented, and the metadata does not advertise them. They are only needed
 for workspace domain restrictions, and advertising a capability that is not
@@ -324,10 +337,48 @@ back from the database afterwards. The processes run with a non-UTC default
 time zone on purpose — a UTC host is the configuration that once hid a
 timestamp defect here.
 
-One thing is still **not** established. Connecting a particular commercial
-MCP client is its own gate: a client's behaviour is not the protocol, and raw
-HTTP passing says nothing about whether, say, ChatGPT's connector accepts
-this server.
+### A commercial client, and what it does not establish
+
+A client's behaviour is not the protocol, so the HTTP controls above said
+nothing about whether any particular product would accept this server. One has
+since connected. ChatGPT's web connector completed the flow against a running
+GitBucket with this plugin installed — discovery, client ID metadata
+registration, GitBucket sign-in, consent — and was then used for ordinary
+work over the resulting connection, by the account that consented, a site
+administrator. The operations observed through it:
+
+- `whoami`, resolving that account and returning the plugin's self-reported
+  descriptor;
+- repository, pull request, issue and review-thread reads;
+- issue creation;
+- adding an issue comment, reading it back, editing that same comment by
+  appending to it, and reading it back byte for byte.
+
+A second MCP client, not ChatGPT's and over a connection whose authentication
+path is not recorded here, has read repositories, issues, pull requests and
+review threads and added pull request comments, as an account **without** the
+administrator flag.
+
+That is the whole of the claim, and it is narrower than "the connector
+works":
+
+- **Refresh and revocation are not established by it.** Both connections were
+  used inside the lifetime of their grants. Rotation, replay and revocation do
+  have evidence — `itest/oauth_controls.py` over raw HTTP — but not from a
+  commercial client.
+- **Neither is the permission matrix.** One administrator and one ordinary
+  account are two accounts, not the visibility × role × `issuesOption` matrix.
+  A read that succeeds for an administrator says nothing about a guest. That
+  matrix is `itest/integration.py`, which drives every tool against every
+  role, and the refused writes are confined to disposable instances.
+- **Nor anything about this source.** The GitBucket these clients reached
+  carries an **earlier build** of this plugin. Its `list_repositories`
+  answers still have no `is_fork` field and no `*_semantics` keys, and still
+  report zero issues and zero pull requests for repositories that have both —
+  the defect the counter correction fixed. So these are observations about the
+  authorization flow and the tool surface *on the build that was installed at
+  the time*. Installing this tree is a separate, deliberate step, and it has
+  not been taken.
 
 A separate gate, `itest/resource_gate.py`, covers the audience check the way
 only a restart can: one server issues a grant while it calls itself one
