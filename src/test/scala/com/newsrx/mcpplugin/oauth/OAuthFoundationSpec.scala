@@ -1,6 +1,8 @@
 package com.newsrx.mcpplugin.oauth
 
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.newsrx.mcpplugin.mcp.ToolRegistry
+import gitbucket.core.model.Account
 import org.junit.runner.RunWith
 import org.scalatestplus.junit.JUnitRunner
 import org.scalatest.funsuite.AnyFunSuite
@@ -294,5 +296,80 @@ class OAuthFoundationSpec extends AnyFunSuite with Matchers {
 
   test("the default grant is the weaker scope") {
     McpScope.default shouldBe Set("mcp:read")
+  }
+
+  // ── the gate every tool call passes through ───────────────────────────────
+  //
+  // `AuthenticatedCaller.permits` is the one place a scope decision is made,
+  // and until now nothing offline exercised it: a mutation that made it
+  // answer `true` for everything left the whole suite green and was caught
+  // only by the live gate. These cases make the decision itself observable.
+
+  private def grantOf(scopes: Set[String]) =
+    ResolvedGrant("g-1", "someone", "https://client.example.com/meta",
+                  "https://example.com/plugin-mcp/", scopes)
+
+  // Every field named, and `accountId` deliberately omitted: 4.46.0's Account
+  // has no such field and 4.48.0 gives it a default, so naming it would pin
+  // this suite to one release for no benefit.
+  private val account = Account(
+    userName = "someone", fullName = "Someone",
+    mailAddress = "someone@example.com", password = "x", isAdmin = false, url = None,
+    registeredDate = new java.util.Date(0), updatedDate = new java.util.Date(0),
+    lastLoginDate = None, image = None, isGroupAccount = false, isRemoved = false,
+    description = None)
+
+  test("a read-only grant does not permit a write") {
+    val caller = AuthenticatedCaller.oauth(account, grantOf(Set("mcp:read")))
+    caller.permits(McpScope.Read) shouldBe true
+    caller.permits(McpScope.Write) shouldBe false
+  }
+
+  test("a write grant permits a read, because write implies read") {
+    val caller = AuthenticatedCaller.oauth(account, grantOf(Set("mcp:write")))
+    caller.permits(McpScope.Write) shouldBe true
+    caller.permits(McpScope.Read) shouldBe true
+  }
+
+  test("a grant carrying no scope permits nothing") {
+    val caller = AuthenticatedCaller.oauth(account, grantOf(Set.empty))
+    caller.permits(McpScope.Read) shouldBe false
+    caller.permits(McpScope.Write) shouldBe false
+  }
+
+  test("an unknown scope string is not a scope") {
+    val caller = AuthenticatedCaller.oauth(account, grantOf(Set("mcp:admin", "write")))
+    caller.permits(McpScope.Read) shouldBe false
+    caller.permits(McpScope.Write) shouldBe false
+  }
+
+  test("a Basic caller holds every scope and carries no grant") {
+    // The existing connection was never scoped; adding OAuth must not
+    // retroactively restrict it.
+    val caller = AuthenticatedCaller.basic(account)
+    caller.permits(McpScope.Read) shouldBe true
+    caller.permits(McpScope.Write) shouldBe true
+    caller.grantId shouldBe None
+  }
+
+  test("an OAuth caller carries its grant, so a revoked grant can be found") {
+    AuthenticatedCaller.oauth(account, grantOf(Set("mcp:read"))).grantId shouldBe Some("g-1")
+  }
+
+  test("every registered tool declares a scope, and mutating tools require write") {
+    // The abstract member means a new tool cannot compile without answering
+    // this. What it cannot do by itself is stop someone answering `Read` for
+    // a tool that writes, so the registry is checked against the names.
+    val mutating = Set("create_issue", "add_issue_comment", "add_pr_comment",
+                       "close_issue", "reopen_issue", "close_pull_request",
+                       "reopen_pull_request", "update_pull_request",
+                       "update_own_comment", "mark_ready_for_review")
+    val tools = ToolRegistry.all(new ObjectMapper())
+    tools.map(_.name).toSet should contain allElementsOf mutating
+    tools.foreach { t =>
+      withClue(s"${t.name}: ") {
+        t.requiredScope shouldBe (if (mutating.contains(t.name)) McpScope.Write else McpScope.Read)
+      }
+    }
   }
 }
