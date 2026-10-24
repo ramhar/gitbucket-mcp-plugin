@@ -85,6 +85,38 @@ def authorize_under(name, client_id, scope="mcp:read mcp:write"):
     return payload
 
 
+# The documented refusals. RFC 6749 §5.2 gives the token endpoint one shape
+# for a rejected grant: HTTP 400 with an `error` code, and 401 when the client
+# itself was not accepted. Anything else — a 500, a 404 from a missing route,
+# a body that is not the documented object — is the server failing to answer,
+# and a failure to answer is not a refusal. Accepting `status >= 400` as proof
+# of authorization meant a crashed endpoint read as a correct denial.
+TOKEN_REFUSAL_STATUSES = (400, 401)
+TOKEN_REFUSAL_ERRORS = {
+    "invalid_request", "invalid_client", "invalid_grant",
+    "unauthorized_client", "unsupported_grant_type", "invalid_scope",
+    "invalid_target",
+}
+
+
+def refused_grant(status, payload, what):
+    """Assert a token-endpoint refusal, or abort: a 5xx proves nothing."""
+    if status not in TOKEN_REFUSAL_STATUSES:
+        raise GateError(
+            f"{what}: expected a token-endpoint refusal {TOKEN_REFUSAL_STATUSES}, got "
+            f"HTTP {status} with {payload!r}. A server failure is not a refusal and "
+            f"this gate cannot read authorization from it.")
+    if not isinstance(payload, dict):
+        raise GateError(
+            f"{what}: HTTP {status} carried {payload!r}, not an OAuth error object.")
+    error = payload.get("error")
+    if error not in TOKEN_REFUSAL_ERRORS:
+        raise GateError(
+            f"{what}: HTTP {status} carried error={error!r}, which is not one of the "
+            f"documented token-endpoint error codes.")
+    return (status, error)
+
+
 def tool_call(name, token, tool, arguments):
     oauth_gate.OBASE = base_url(name)
     status, headers, payload = oauth_gate.tool(token, tool, arguments)
@@ -157,7 +189,9 @@ def run(war, candidate, home):
 
         st, payload = oauth_gate.token(grant_type="refresh_token", refresh_token=refresh,
                                        client_id=client_id)
-        check("its refresh token is refused under the other resource", st >= 400, True)
+        check("its refresh token is refused under the other resource",
+              refused_grant(st, payload, "refresh under the other resource")[0] in
+              TOKEN_REFUSAL_STATUSES, True)
         gb.stop()
 
         # ── A again: nothing was destroyed by being refused ───────────────
@@ -169,7 +203,9 @@ def run(war, candidate, home):
         oauth_gate.OBASE = base_url(NAME_A)
         st, payload = oauth_gate.token(grant_type="refresh_token", refresh_token=refresh,
                                        client_id=client_id, resource="https://elsewhere.example.com/mcp/")
-        check("a refresh naming the wrong resource is refused", st >= 400, True)
+        check("a refresh naming the wrong resource is refused",
+              refused_grant(st, payload, "refresh naming the wrong resource")[0] in
+              TOKEN_REFUSAL_STATUSES, True)
         st, payload = oauth_gate.token(grant_type="refresh_token", refresh_token=refresh,
                                        client_id=client_id, resource=resource_of(NAME_A))
         check("and the lawful refresh still works, so it was not consumed",

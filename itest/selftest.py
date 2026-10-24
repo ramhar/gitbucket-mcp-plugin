@@ -261,6 +261,51 @@ fires("a count that falls across one operation aborts rather than reporting a ne
           refusing_tool_that_writes_nothing, "owner1", "priv-private"),
       "fell from 2 to 0")
 
+# ── 10. a server failure is not an authorization refusal ──────────────────
+#
+# The resource gate asserted `status >= 400` at its two refresh sites, so an
+# HTTP 500 counted as a denial and the gate reported 15/15 and exit 0 while
+# two of its negative checks had observed nothing at all. These drive the same
+# helper those call sites now use.
+print("\n## 10. a server failure is not an authorization refusal")
+from resource_gate import refused_grant, TOKEN_REFUSAL_STATUSES
+
+for status in (500, 502, 503):
+    fires(f"HTTP {status} is not a refusal, whatever the body says",
+          lambda st=status: refused_grant(st, {"error": "invalid_grant"}, "control"),
+          "is not a refusal")
+
+fires("a missing token endpoint is not a refusal",
+      lambda: refused_grant(404, {"error": "invalid_grant"}, "control"),
+      "is not a refusal")
+fires("a 200 is certainly not a refusal",
+      lambda: refused_grant(200, {"access_token": "t"}, "control"),
+      "is not a refusal")
+fires("a refusal status carrying no object is not a refusal",
+      lambda: refused_grant(400, "server error", "control"),
+      "not an OAuth error object")
+fires("a refusal status carrying nothing is not a refusal",
+      lambda: refused_grant(400, None, "control"),
+      "not an OAuth error object")
+fires("a documented status with an undocumented error code is not a refusal",
+      lambda: refused_grant(400, {"error": "server_error"}, "control"),
+      "not one of the documented")
+fires("a documented status with no error code is not a refusal",
+      lambda: refused_grant(400, {"error_description": "nope"}, "control"),
+      "not one of the documented")
+
+# The positive twins: the guard has to accept what the server really answers,
+# or it would merely be strict rather than correct.
+allows("a 400 invalid_grant is the documented refusal",
+       lambda: refused_grant(400, {"error": "invalid_grant"}, "control"), (400, "invalid_grant"))
+allows("a 400 invalid_target is the documented refusal for a wrong audience",
+       lambda: refused_grant(400, {"error": "invalid_target"}, "control"), (400, "invalid_target"))
+allows("a 401 invalid_client is a refusal of the client itself",
+       lambda: refused_grant(401, {"error": "invalid_client"}, "control"), (401, "invalid_client"))
+allows("extra fields alongside a documented error are still a refusal",
+       lambda: refused_grant(400, {"error": "invalid_grant", "error_description": "x"}, "control"),
+       (400, "invalid_grant"))
+
 bad = [r for r in RESULTS if not r[0]]
 print()
 print(f"=== GATE SELF-TEST: {len(RESULTS)-len(bad)} passed, {len(bad)} failed ===")
