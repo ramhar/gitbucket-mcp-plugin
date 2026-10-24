@@ -393,4 +393,119 @@ class PinnedFetchSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     val r = fetchFromWire(_ => "this is not a response\r\n")
     refusedByFraming(r)
   }
+
+  // ── transport bounds ──────────────────────────────────────────────────────
+  //
+  // Two bounds were lost when message parsing moved to a maintained stack, and
+  // neither loss was visible from a response the server had already finished
+  // sending. The cap still threw, but closing a half-read entity makes the
+  // client consume the rest of the framed body first, so a peer that keeps
+  // supplying a tail held the fetch open past the cap. And the connection
+  // manager's default message constraints are unlimited, so a single 1 MiB
+  // header was accepted.
+
+  /**
+   * A server that overruns the cap and then keeps the body coming until it is
+   * released.
+   *
+   * The open tail is the whole point: a large response the server has already
+   * completed cannot detect the drain, because there is nothing left to drain.
+   */
+  private class Overrunning(capBytes: Int) {
+    private val listener = new ServerSocket(0, 1, loopback)
+    private val release = new java.util.concurrent.CountDownLatch(1)
+    private val sent = new AtomicInteger(0)
+    val returned = new AtomicInteger(0)
+    val clientId = s"http://localhost:${listener.getLocalPort}/client.json"
+
+    private val t = new Thread(() => {
+      try {
+        val s = listener.accept()
+        try {
+          val in = s.getInputStream
+          var last = ""
+          var c = in.read()
+          while (c >= 0 && !last.endsWith("\r\n\r\n")) {
+            last = (last + c.toChar).takeRight(4)
+            if (!last.endsWith("\r\n\r\n")) c = in.read()
+          }
+          val out = s.getOutputStream
+          // A huge declared length, so the body is well framed and the client
+          // has every reason to keep reading.
+          val declared = capBytes.toLong * 64
+          out.write(s"HTTP/1.1 200 OK\r\nContent-Length: $declared\r\n\r\n".getBytes("UTF-8"))
+          out.flush()
+          val block = Array.fill[Byte](8192)('x'.toByte)
+          // Past the cap first, then keep going until released or the peer
+          // goes away.
+          while (release.getCount > 0 && sent.get() < declared) {
+            out.write(block); out.flush()
+            sent.addAndGet(block.length)
+            if (sent.get() > capBytes * 8) release.await(50, java.util.concurrent.TimeUnit.MILLISECONDS)
+          }
+        } finally s.close()
+      } catch { case _: Exception => () } finally listener.close()
+    })
+    t.setDaemon(true); t.start()
+
+    def bytesSent: Int = sent.get()
+    def stop(): Unit = { release.countDown(); t.join(3000); listener.close() }
+  }
+
+  test("a body past the cap ends the fetch instead of draining the tail") {
+    val previous = System.getProperty(ClientMetadata.AllowLoopbackProperty)
+    System.setProperty(ClientMetadata.AllowLoopbackProperty, "true")
+    val server = new Overrunning(64 * 1024)
+    try {
+      val done = new java.util.concurrent.CountDownLatch(1)
+      @volatile var result: Either[ClientMetadataError, OAuthClient] = null
+      val caller = new Thread(() => {
+        result = ClientMetadata.fetch(mapper, server.clientId, allowLoopback = true,
+          resolve = resolvesTo(loopback))
+        done.countDown()
+      })
+      caller.setDaemon(true); caller.start()
+
+      // The fetch has to finish on its own, while the peer is still willing to
+      // send. If it only finishes once the fixture stops, the cap is not a
+      // bound on anything.
+      val finishedOnItsOwn = done.await(20, java.util.concurrent.TimeUnit.SECONDS)
+      withClue(s"still pending after ${server.bytesSent} bytes: ")(finishedOnItsOwn shouldBe true)
+      withClue(s"$result: ")(result.isLeft shouldBe true)
+      caller.join(3000)
+    } finally {
+      server.stop()
+      if (previous == null) System.clearProperty(ClientMetadata.AllowLoopbackProperty)
+      else System.setProperty(ClientMetadata.AllowLoopbackProperty, previous)
+    }
+  }
+
+  test("a single oversized header is refused") {
+    val r = fetchFromWire { id =>
+      val b = document(id)
+      val huge = "x" * (1024 * 1024)
+      s"HTTP/1.1 200 OK\r\nX-Big: $huge\r\nContent-Length: ${b.getBytes("UTF-8").length}\r\nConnection: close\r\n\r\n$b"
+    }
+    refusedByFraming(r)
+  }
+
+  test("too many headers are refused") {
+    val r = fetchFromWire { id =>
+      val b = document(id)
+      val many = (1 to 500).map(i => s"X-Pad-$i: v\r\n").mkString
+      s"HTTP/1.1 200 OK\r\n${many}Content-Length: ${b.getBytes("UTF-8").length}\r\nConnection: close\r\n\r\n$b"
+    }
+    refusedByFraming(r)
+  }
+
+  test("an ordinary number of ordinary headers is accepted") {
+    // The lawful twin: the bounds have to admit a normal response, or they
+    // would be refusing for the wrong reason above.
+    val r = fetchFromWire { id =>
+      val b = document(id)
+      val ordinary = (1 to 20).map(i => s"X-Pad-$i: value-$i\r\n").mkString
+      s"HTTP/1.1 200 OK\r\n${ordinary}Content-Type: application/json\r\nContent-Length: ${b.getBytes("UTF-8").length}\r\nConnection: close\r\n\r\n$b"
+    }
+    withClue(s"$r: ")(r.isRight shouldBe true)
+  }
 }

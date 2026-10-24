@@ -7,7 +7,7 @@ import java.nio.charset.StandardCharsets
 import javax.net.ssl.HttpsURLConnection
 import org.apache.http.client.config.RequestConfig
 import org.apache.http.client.methods.HttpGet
-import org.apache.http.config.RegistryBuilder
+import org.apache.http.config.{ConnectionConfig, MessageConstraints, RegistryBuilder}
 import org.apache.http.conn.DnsResolver
 import org.apache.http.conn.socket.{ConnectionSocketFactory, PlainConnectionSocketFactory}
 import org.apache.http.conn.ssl.{DefaultHostnameVerifier, SSLConnectionSocketFactory}
@@ -56,6 +56,10 @@ final case class PinnedResponse(status: Int, body: String)
  */
 object PinnedConnection {
 
+  /** Header bounds, restored explicitly after the move to a maintained stack. */
+  private val MaxHeaderLine = 8 * 1024
+  private val MaxHeaderCount = 100
+
   def fetch(url: URL, address: InetAddress, connectTimeoutMs: Int,
             readTimeoutMs: Int, maxBytes: Int): PinnedResponse = {
     val scheme = Option(url.getProtocol).map(_.toLowerCase).getOrElse("")
@@ -81,6 +85,20 @@ object PinnedConnection {
       .build()
 
     val manager = new BasicHttpClientConnectionManager(registry, null, null, pinned)
+
+    // Explicit, finite header bounds. The connection manager's default
+    // message constraints are unlimited, which quietly dropped the limits the
+    // previous transport had: a single 1 MiB header was accepted. These two
+    // are what the maintained stack offers, and together they bound the whole
+    // header block -- at most MaxHeaderCount lines of at most MaxHeaderLine
+    // bytes each.
+    manager.setConnectionConfig(ConnectionConfig.custom()
+      .setMessageConstraints(MessageConstraints.custom()
+        .setMaxLineLength(MaxHeaderLine)
+        .setMaxHeaderCount(MaxHeaderCount)
+        .build())
+      .build())
+
     val config = RequestConfig.custom()
       .setConnectTimeout(connectTimeoutMs)
       .setConnectionRequestTimeout(connectTimeoutMs)
@@ -101,19 +119,27 @@ object PinnedConnection {
       .disableAuthCaching()
       .build()
 
+    val get = new HttpGet(url.toURI)
     try {
-      val response = client.execute(new HttpGet(url.toURI))
+      val response = client.execute(get)
+      var finished = false
       try {
         val status = response.getStatusLine.getStatusCode
         val entity = response.getEntity
         val body =
           if (entity == null) ""
-          else {
-            val in = entity.getContent
-            try readBounded(in, maxBytes) finally in.close()
-          }
+          else readBounded(entity.getContent, maxBytes)
+        finished = true
         PinnedResponse(status, body)
-      } finally response.close()
+      } finally {
+        // Closing an entity stream that has not been read to its end makes
+        // Apache consume the rest of the framed body first, so a peer that
+        // keeps supplying a tail holds the fetch open long after the cap was
+        // exceeded -- which is exactly what the cap exists to prevent.
+        // Aborting discards the connection instead, with nothing drained.
+        if (!finished) try get.abort() catch { case _: Exception => () }
+        try response.close() catch { case _: Exception => () }
+      }
     } catch {
       case e: IOException => throw e
       case e: Exception   => throw new IOException(e.getMessage, e)
@@ -130,6 +156,11 @@ object PinnedConnection {
    * the same defect as accepting a short body, one step removed. The stream is
    * read to its end, so httpcore's own framing checks run — a body that stops
    * early raises there rather than arriving here as a short string.
+   *
+   * The stream is deliberately not closed here. On the lawful path it has
+   * already reached its end and the response close releases it; on overflow
+   * the caller aborts the request instead, because closing a half-read entity
+   * drains the remainder first.
    */
   private def readBounded(in: InputStream, maxBytes: Int): String = {
     val out = new ByteArrayOutputStream()

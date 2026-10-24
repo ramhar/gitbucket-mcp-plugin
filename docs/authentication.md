@@ -140,6 +140,16 @@ raises on both — and it is already on GitBucket's runtime classpath, so it is
 `compileOnly` and nothing is bundled. The size limit refuses an oversized
 document rather than returning a prefix of it, for the same reason.
 
+Two bounds need stating explicitly, because moving to a maintained stack lost
+them both and neither loss is visible from a response the server has already
+finished sending. A body past the cap **aborts the request** rather than
+closing the entity stream: closing a half-read entity makes the client consume
+the rest of the framed body first, so a peer that keeps supplying a tail would
+hold the fetch open exactly as long as it liked. And the connection manager's
+default message constraints are unlimited, so header line length and header
+count are set explicitly — 8 KiB and 100, which together bound the whole
+header block.
+
 Redirects are refused rather than re-validated because an allowed host
 bouncing to a forbidden one is the usual way such a fence is bypassed, and
 there is no legitimate reason for a client's own metadata document to move.
