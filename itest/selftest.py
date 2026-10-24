@@ -268,7 +268,7 @@ fires("a count that falls across one operation aborts rather than reporting a ne
 # two of its negative checks had observed nothing at all. These drive the same
 # helper those call sites now use.
 print("\n## 10. a server failure is not an authorization refusal")
-from resource_gate import refused_grant, TOKEN_REFUSAL_STATUSES
+from resource_gate import refused_grant, TOKEN_REFUSAL_STATUSES, REFRESH_REFUSAL
 
 for status in (500, 502, 503):
     fires(f"HTTP {status} is not a refusal, whatever the body says",
@@ -298,13 +298,34 @@ fires("a documented status with no error code is not a refusal",
 # or it would merely be strict rather than correct.
 allows("a 400 invalid_grant is the documented refusal",
        lambda: refused_grant(400, {"error": "invalid_grant"}, "control"), (400, "invalid_grant"))
-allows("a 400 invalid_target is the documented refusal for a wrong audience",
-       lambda: refused_grant(400, {"error": "invalid_target"}, "control"), (400, "invalid_target"))
-allows("a 401 invalid_client is a refusal of the client itself",
-       lambda: refused_grant(401, {"error": "invalid_client"}, "control"), (401, "invalid_client"))
+allows("a 400 invalid_target is the documented refusal on the code path",
+       lambda: refused_grant(400, {"error": "invalid_target"}, "control",
+                             expected=(400, "invalid_target")), (400, "invalid_target"))
+allows("a 401 invalid_client is a refusal of the client itself, where that is expected",
+       lambda: refused_grant(401, {"error": "invalid_client"}, "control",
+                             expected=(401, "invalid_client")), (401, "invalid_client"))
 allows("extra fields alongside a documented error are still a refusal",
        lambda: refused_grant(400, {"error": "invalid_grant", "error_description": "x"}, "control"),
        (400, "invalid_grant"))
+
+# A refusal that is not *this* scenario's refusal. Each of these is a lawful,
+# documented OAuth error -- and none of them says the resource binding was
+# examined, which is the only thing these two scenarios exist to establish.
+for wrong_status, wrong_error in [
+        (401, "invalid_client"), (400, "invalid_client"),
+        (400, "invalid_request"), (400, "invalid_target"),
+        (400, "unauthorized_client"), (400, "invalid_scope"),
+        (400, "unsupported_grant_type")]:
+    fires(f"a refresh scenario does not accept {wrong_status} {wrong_error}",
+          lambda st=wrong_status, er=wrong_error:
+              refused_grant(st, {"error": er}, "control"),
+          "not the one this scenario establishes")
+
+allows("and the pair it is entitled to still passes",
+       lambda: refused_grant(400, {"error": "invalid_grant"}, "control"), REFRESH_REFUSAL)
+allows("a scenario may name a different expected pair explicitly",
+       lambda: refused_grant(400, {"error": "invalid_target"}, "control",
+                             expected=(400, "invalid_target")), (400, "invalid_target"))
 
 bad = [r for r in RESULTS if not r[0]]
 print()

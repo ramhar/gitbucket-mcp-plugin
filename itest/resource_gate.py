@@ -99,8 +99,25 @@ TOKEN_REFUSAL_ERRORS = {
 }
 
 
-def refused_grant(status, payload, what):
-    """Assert a token-endpoint refusal, or abort: a 5xx proves nothing."""
+# What each refresh scenario is entitled to see. `OAuthEndpoints.refreshFailure`
+# answers `400 invalid_grant` for every rotation failure, deliberately, so a
+# refusal cannot disclose which binding was wrong. That uniformity is a
+# production property and stays; what it means for this gate is that the only
+# response proving the resource binding was consulted is that exact pair.
+REFRESH_REFUSAL = (400, "invalid_grant")
+
+
+def refused_grant(status, payload, what, expected=REFRESH_REFUSAL):
+    """
+    Assert the refusal this scenario is entitled to, or abort.
+
+    Checking only that the status was >= 400, or only that it was some
+    documented refusal, is not enough. An `invalid_client` says the client was
+    not accepted; an `invalid_request` says the request was malformed. Neither
+    is evidence that the resource binding was examined, and a scenario that
+    accepts them reports a restriction it never observed.
+    """
+    want_status, want_error = expected
     if status not in TOKEN_REFUSAL_STATUSES:
         raise GateError(
             f"{what}: expected a token-endpoint refusal {TOKEN_REFUSAL_STATUSES}, got "
@@ -114,6 +131,11 @@ def refused_grant(status, payload, what):
         raise GateError(
             f"{what}: HTTP {status} carried error={error!r}, which is not one of the "
             f"documented token-endpoint error codes.")
+    if (status, error) != (want_status, want_error):
+        raise GateError(
+            f"{what}: expected {want_status} {want_error!r}, got {status} {error!r}. "
+            f"That is a refusal, but not the one this scenario establishes, so it is "
+            f"no evidence that the resource binding was checked.")
     return (status, error)
 
 
@@ -190,8 +212,8 @@ def run(war, candidate, home):
         st, payload = oauth_gate.token(grant_type="refresh_token", refresh_token=refresh,
                                        client_id=client_id)
         check("its refresh token is refused under the other resource",
-              refused_grant(st, payload, "refresh under the other resource")[0] in
-              TOKEN_REFUSAL_STATUSES, True)
+              refused_grant(st, payload, "refresh under the other resource"),
+              REFRESH_REFUSAL)
         gb.stop()
 
         # ── A again: nothing was destroyed by being refused ───────────────
@@ -204,8 +226,8 @@ def run(war, candidate, home):
         st, payload = oauth_gate.token(grant_type="refresh_token", refresh_token=refresh,
                                        client_id=client_id, resource="https://elsewhere.example.com/mcp/")
         check("a refresh naming the wrong resource is refused",
-              refused_grant(st, payload, "refresh naming the wrong resource")[0] in
-              TOKEN_REFUSAL_STATUSES, True)
+              refused_grant(st, payload, "refresh naming the wrong resource"),
+              REFRESH_REFUSAL)
         st, payload = oauth_gate.token(grant_type="refresh_token", refresh_token=refresh,
                                        client_id=client_id, resource=resource_of(NAME_A))
         check("and the lawful refresh still works, so it was not consumed",
