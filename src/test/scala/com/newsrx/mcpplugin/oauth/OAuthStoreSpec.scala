@@ -505,6 +505,45 @@ class OAuthStoreSpec extends AnyFunSuite with Matchers {
     }
   }
 
+  // ── the audience is a binding, not a note in a table ─────────────────────
+
+  test("a refresh for another resource is refused, and nothing moves") {
+    withDb { conn =>
+      val grantId = seedGrant(conn)
+      val refresh = OAuthStore.setRefreshToken(conn, grantId, now.plusSeconds(3600), now)
+      OAuthStore.rotateRefreshToken(conn, refresh, clientId, now.plusSeconds(3600), now,
+        resource = Some("https://elsewhere.example.com/plugin-mcp/")) shouldBe
+        Left(GrantFailure.ResourceMismatch)
+      withClue("the grant survives: ")(OAuthStore.findGrant(conn, grantId) should not be empty)
+      withClue("and the token was not consumed: ")(
+        OAuthStore.rotateRefreshToken(conn, refresh, clientId, now.plusSeconds(3600), now,
+          resource = Some(resource)).isRight shouldBe true)
+    }
+  }
+
+  test("a refresh asking for the wrong resource is refused, and nothing moves") {
+    withDb { conn =>
+      val grantId = seedGrant(conn)
+      val refresh = OAuthStore.setRefreshToken(conn, grantId, now.plusSeconds(3600), now)
+      OAuthStore.rotateRefreshToken(conn, refresh, clientId, now.plusSeconds(3600), now,
+        resource = Some(resource),
+        requestedResource = Some("https://elsewhere.example.com/plugin-mcp/")) shouldBe
+        Left(GrantFailure.ResourceMismatch)
+      OAuthStore.findGrant(conn, grantId) should not be empty
+      OAuthStore.rotateRefreshToken(conn, refresh, clientId, now.plusSeconds(3600), now,
+        resource = Some(resource), requestedResource = Some(resource)).isRight shouldBe true
+    }
+  }
+
+  test("a matching resource is not an obstacle") {
+    withDb { conn =>
+      val grantId = seedGrant(conn)
+      val refresh = OAuthStore.setRefreshToken(conn, grantId, now.plusSeconds(3600), now)
+      OAuthStore.rotateRefreshToken(conn, refresh, clientId, now.plusSeconds(3600), now,
+        resource = Some(resource), requestedResource = Some(resource)).isRight shouldBe true
+    }
+  }
+
   test("a binding failure leaves a lawful refresh token usable") {
     // The distinction the policy depends on: presenting the right token with
     // the wrong client is a binding failure, not a replay. It must not

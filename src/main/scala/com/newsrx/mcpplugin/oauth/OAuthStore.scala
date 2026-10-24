@@ -324,8 +324,19 @@ object OAuthStore {
    * of this code did exactly that, and the concurrency test above is what
    * found it.
    */
+  /**
+   * Exchange a refresh token for its successor.
+   *
+   * `resource` is the audience this server currently is; `requestedResource`
+   * is what the client asked for, when it asked. Both are bindings, checked
+   * like the client id and before anything is written: a grant minted for
+   * another deployment is not a credential here, however valid it is there.
+   */
   def rotateRefreshToken(conn: Connection, presented: String, clientId: String,
-                         expiresAt: Instant, now: Instant): Either[GrantFailure, (ResolvedGrant, String)] = {
+                         expiresAt: Instant, now: Instant,
+                         resource: Option[String] = None,
+                         requestedResource: Option[String] = None
+                        ): Either[GrantFailure, (ResolvedGrant, String)] = {
     val presentedHash = Secrets.hash(presented)
 
     // The bindings are checked before anything is written. A refresh token
@@ -341,6 +352,11 @@ object OAuthStore {
           case None => Left(GrantFailure.Revoked)
           case Some(grant) if !Secrets.constantTimeEquals(clientId, grant.clientId) =>
             Left(GrantFailure.ClientMismatch)
+          case Some(grant) if resource.exists(r => !Secrets.constantTimeEquals(r, grant.resource)) =>
+            // The grant belongs to a different audience than this server is.
+            Left(GrantFailure.ResourceMismatch)
+          case Some(grant) if requestedResource.exists(r => !Secrets.constantTimeEquals(r, grant.resource)) =>
+            Left(GrantFailure.ResourceMismatch)
           case Some(grant) => Right(grant)
         }
     }

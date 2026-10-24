@@ -212,8 +212,10 @@ trait OAuthEndpoints extends ControllerBase {
       return tokenError(400, "invalid_request", "refresh_token and client_id are required")
 
     val moment = now()
+    val requested = Option(param("resource")).filter(_.nonEmpty)
     OAuthStore.rotateRefreshToken(conn, refresh, clientId,
-      moment.plusSeconds(config.refreshTokenLifetimeSeconds), moment) match {
+      moment.plusSeconds(config.refreshTokenLifetimeSeconds), moment,
+      resource = Some(config.resource), requestedResource = requested) match {
       case Left(failure) => refreshFailure(failure)
       case Right((grant, replacement)) =>
         val access = OAuthStore.issueAccessToken(conn, grant.grantId,

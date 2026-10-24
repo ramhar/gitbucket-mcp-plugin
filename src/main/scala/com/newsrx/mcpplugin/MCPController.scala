@@ -242,9 +242,18 @@ class MCPController
     oauthConfig match {
       case None => Left(ChallengeError.InvalidToken)
       case Some(_) if token.isEmpty => Left(ChallengeError.InvalidRequest)
-      case Some(_) =>
+      case Some(config) =>
         OAuthStore.resolveAccessToken(oauthConn, token, now()) match {
           case Left(_) => Left(ChallengeError.InvalidToken)
+          // The grant records which resource it was minted for, and that is
+          // only a fact in a table until it is compared with the resource this
+          // server actually is. A token outlives the request that created it:
+          // a reconfigured deployment, or a neighbouring one, hands over a
+          // perfectly valid unexpired credential for somewhere else. Refused
+          // here, before any tool is chosen, and reported exactly like any
+          // other unusable token so it reveals nothing.
+          case Right(grant) if grant.resource != config.resource =>
+            Left(ChallengeError.InvalidToken)
           case Right(grant) =>
             implicit val s = Database.getSession(request)
             // The account is resolved now, not trusted from the grant row: an
