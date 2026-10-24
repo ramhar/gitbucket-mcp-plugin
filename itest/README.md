@@ -19,8 +19,14 @@ and an empty `GITBUCKET_HOME`:
 ```sh
 java -jar gitbucket.war --port=8099 --host=127.0.0.1 --gitbucket.home=/tmp/gb-itest
 # drop the plugin JAR into /tmp/gb-itest/plugins/ and restart
-python3 itest/integration.py
+MCP_PLUGIN_JAR=/tmp/gb-itest/plugins/gitbucket-mcp-plugin-*.jar python3 itest/integration.py
 ```
+
+`MCP_PLUGIN_JAR` is required, not optional. The gate compares the version the
+plugin reports with the descriptor packaged in that JAR; checking it against a
+literal written here would re-introduce exactly the defect the descriptor
+lookup exists to prevent, and would quietly encode one fork's version number.
+An unset or unreadable path is exit 2, like every other precondition.
 
 `oauth_controls.py` is a second gate over the same instance, covering the
 OAuth flow. It needs two more system properties on the GitBucket command
@@ -38,6 +44,29 @@ python3 itest/oauth_controls.py
 Use `localhost` for the browser part and `127.0.0.1` for the REST control
 calls, as the files do: the consent form's action is built from the
 configured base URL, so the session cookie has to live on that host name.
+
+## Installation and upgrade
+
+`upgrade_gate.py` is different from the two above: it starts and stops its own
+GitBucket processes rather than talking to one you started, because what it
+checks is startup, migration and restart.
+
+```sh
+python3 itest/upgrade_gate.py \
+  --war gitbucket.war \
+  --previous <the plugin being replaced>.jar \
+  --candidate build/libs/gitbucket-mcp-plugin-*.jar \
+  --home /tmp/gb-upgrade
+```
+
+Add `--db-url jdbc:postgresql://host:port/db --db-user … --db-password …` to
+run the whole sequence against PostgreSQL. Without it the bundled H2 is used,
+and the PostgreSQL path remains generated DDL rather than an executed
+migration.
+
+It refuses to start if something else is already serving the port: a leftover
+server answers health checks and would otherwise be mistaken for the artifact
+under test. It stops every process it started, including when it aborts.
 
 `oauth_gate.py` holds the flow helpers — a local HTTP server that publishes
 client metadata documents, PKCE, a non-following HTTP client so redirects are

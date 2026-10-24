@@ -202,6 +202,10 @@ that release ships:
 | 4.47.0 | 11.38.2 | ✅ Tested |
 | 4.46.0 | 11.33 | ✅ Tested |
 
+The live, OAuth and upgrade harnesses have been run on 4.48.0, including the
+PostgreSQL migration path. For 4.46.0 and 4.47.0 the evidence is the unit
+suite against their own runtime classpaths.
+
 Versions below 4.46.0 are untested rather than known broken: the plugin uses
 `anonymousAccessiblePaths`, which earlier releases may not have, and the OAuth
 code depends on `oauth2-oidc-sdk` being on the host's classpath. Anything
@@ -239,9 +243,32 @@ cp build/libs/gitbucket-mcp-plugin-*.jar $GITBUCKET_HOME/plugins/
 # start GitBucket on 127.0.0.1:8099, with OAuth configured for the second suite:
 #   -Dgitbucket.mcp.oauth.baseUrl=http://localhost:8099
 #   -Dgitbucket.mcp.oauth.allowLoopbackClients=true
-python3 itest/integration.py      # the tools, against GitBucket's own REST API
+MCP_PLUGIN_JAR=$GITBUCKET_HOME/plugins/gitbucket-mcp-plugin-*.jar \
+  python3 itest/integration.py    # the tools, against GitBucket's own REST API
 python3 itest/oauth_controls.py   # the OAuth flow, over HTTP
 ```
+
+`integration.py` needs `MCP_PLUGIN_JAR` to name the exact JAR installed on the
+instance, so the version the plugin reports can be compared with the
+descriptor actually packaged in the artifact rather than with a literal.
+
+Installation and upgrade are a third harness, and it starts and stops its own
+GitBucket processes rather than using a running one:
+
+```bash
+python3 itest/upgrade_gate.py \
+  --war gitbucket.war \
+  --previous <the plugin currently installed>.jar \
+  --candidate build/libs/gitbucket-mcp-plugin-*.jar \
+  --home /tmp/gb-upgrade          # must not exist, or be empty
+```
+
+It covers a fresh install, the upgrade through GitBucket's own plugin
+mechanism, the migration running, data created under the previous plugin
+surviving, and grants and revocations surviving a restart. Add
+`--db-url jdbc:postgresql://…` (with `--db-user`, `--db-password`) to run the
+same sequence against PostgreSQL instead of the bundled H2; without it the
+PostgreSQL path is generated DDL, not an executed migration.
 
 `integration.py` exercises every tool against each repository visibility and
 each collaborator role, comparing the plugin's answer with GitBucket's own.
