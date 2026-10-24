@@ -871,11 +871,17 @@ class ToolExecutionSpec extends AnyFunSuite with Matchers {
     admin.get("count").asInt() shouldBe 1
   }
 
-  test("a role that was sufficient at enumeration and is gone at the detail read") {
+  test("a role removed between two invocations stops the repository being published") {
     // The same shape as the privacy transition, from the other direction: the
     // caller's access disappears rather than the repository's visibility
-    // changing. The enumeration object is readable to the guest; the fresh one
-    // is private and the role has been dropped by then.
+    // changing.
+    //
+    // The role is removed *between two complete invocations*, so within each
+    // one it is constant. That is what this control establishes, and no more:
+    // it does not place the removal between the enumeration and the detail
+    // read of a single call. Covering that boundary needs a fixture which
+    // drops the role during the detail read itself, which is a separate
+    // control and not this one.
     val w = new ToolWorld
     val enumerated = repoInfo("example-org", "secret", isPrivate = true)
     w.userRepositories("example-org") = List(enumerated)
