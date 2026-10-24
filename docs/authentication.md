@@ -238,13 +238,38 @@ production dispatcher — with the effects read back from GitBucket's own REST
 API rather than from the plugin's replies. Those controls are
 `itest/oauth_controls.py`.
 
-Two things are **not** established by any of that. Connecting a particular
-commercial MCP client is its own gate: a client's behaviour is not the
-protocol, and raw HTTP passing says nothing about whether, say, ChatGPT's
-connector accepts this server. And the storage tests run on H2; the migration
-is written in portable Liquibase change elements and is expected to apply to
-PostgreSQL, but an executed PostgreSQL upgrade is a separate thing from
-generated DDL, and until it has been run it should be read as untested.
+Installation, upgrade and restart are a separate gate again, because a
+migration can be written, committed, tested against a database directly and
+still never run: what executes is what the loaded `Plugin` class declares and
+what Solidbase finds packaged in the JAR. `itest/upgrade_gate.py` starts real
+GitBucket processes and checks the operator's questions — the previous
+plugin runs, the candidate replaces it, the migration executes, data created
+under the previous plugin survives, a grant issued after the upgrade survives
+a restart, and a revocation performed before a restart is still in force
+after it. That last one is what distinguishes persistence from a cache.
+
+That gate has been run on **both** supported backends: the bundled H2, and
+PostgreSQL 16, from a blank database through the pre-OAuth plugin to this
+one. On PostgreSQL the four tables and the recorded module version were read
+back from the database afterwards. The processes run with a non-UTC default
+time zone on purpose — a UTC host is the configuration that once hid a
+timestamp defect here.
+
+One thing is still **not** established. Connecting a particular commercial
+MCP client is its own gate: a client's behaviour is not the protocol, and raw
+HTTP passing says nothing about whether, say, ChatGPT's connector accepts
+this server.
+
+### The guards have been shown to fail
+
+A suite that passes says nothing until a broken implementation makes it fail.
+Five single-line mutations of production source — the scope gate permitting
+everything, a code's `redirect_uri` binding unchecked, a refresh token's
+client binding unchecked, the SSRF fence opened, and PKCE accepted without
+verification — each turn the suite red on the controls written for that
+guard, and the source is restored byte-for-byte afterwards. The first of
+those mutations originally left the suite green, which is how the scope gate
+turned out to have no offline control at all; it has one now.
 
 ## Configuration
 
