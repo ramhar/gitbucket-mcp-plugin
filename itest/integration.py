@@ -80,6 +80,40 @@ if _FAULTS:
 def fault(name):
     return name in _FAULTS
 
+
+# The version the plugin reports has to be checked against the artifact under
+# test, not against a literal: a literal is exactly the defect this check
+# exists to catch, and it also silently encodes one lineage's version number.
+# Fail-closed, like every other precondition here — an unreadable descriptor
+# is not a passing check, it is a gate that could not be run.
+def _packaged_plugin_version():
+    import configparser
+    import zipfile
+
+    jar = os.environ.get("MCP_PLUGIN_JAR", "")
+    if not jar:
+        raise GateError(
+            "MCP_PLUGIN_JAR is not set. It must name the exact plugin JAR installed on the "
+            "instance under test, so the reported version can be compared with the packaged "
+            "descriptor instead of a hardcoded string.")
+    if not os.path.isfile(jar):
+        raise GateError(f"MCP_PLUGIN_JAR does not name a readable file: {jar}")
+    try:
+        with zipfile.ZipFile(jar) as z:
+            raw = z.read("gitbucket-plugin.properties").decode("utf-8")
+    except Exception as exc:
+        raise GateError(f"cannot read gitbucket-plugin.properties from {jar}: {exc}")
+    parser = configparser.ConfigParser()
+    parser.read_string("[d]\n" + raw)
+    version = parser["d"].get("pluginversion", "").strip()
+    if not version:
+        raise GateError(f"{jar} packages a descriptor with no pluginVersion")
+    return version
+
+
+PACKAGED_VERSION = _packaged_plugin_version()
+print(f"artifact under test declares pluginVersion={PACKAGED_VERSION}\n")
+
 prs, BASE_DIR, FORK_DIR, SHAS = fixtures.build()
 SAME, FORKPR = prs["same_draft"], prs["fork_draft"]
 APIMERGE, WEBMERGE = prs["api_merge"], prs["web_merge"]
@@ -99,7 +133,11 @@ check("a wrong password is rejected at the transport", rpc("devuser","tools/list
 check("an unknown account is rejected at the transport", rpc("devuser","tools/list",creds=("nobody","x"))[0], 401)
 st,b = rpc("devuser","tools/list")
 check("tools/list publishes the full registry over HTTP", (st, len(b["result"]["tools"])), (200, 19))
-check("initialize reports the descriptor version", rpc("devuser","initialize",{"protocolVersion":"2024-11-05","capabilities":{}})[1]["result"]["serverInfo"]["version"], "0.1.2-SNAPSHOT")
+check("initialize reports the version packaged in the artifact under test",
+      rpc("devuser","initialize",{"protocolVersion":"2024-11-05","capabilities":{}})[1]["result"]["serverInfo"]["version"],
+      PACKAGED_VERSION)
+check("whoami reports the same packaged version, so both read the descriptor",
+      call("devuser","whoami",{})[1].get("plugin",{}).get("plugin_version"), PACKAGED_VERSION)
 
 # ── 2. read authorization, against GitBucket's own role lookup ──────────────
 print("\n## 2. read authorization")
