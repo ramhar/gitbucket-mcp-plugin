@@ -272,4 +272,125 @@ class PinnedFetchSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
         ClientMetadata.isForbiddenAddress(InetAddress.getByName(ip)) shouldBe false)
     }
   }
+
+  // ── message framing ───────────────────────────────────────────────────────
+  //
+  // A JSON document that parses is not evidence that the HTTP message carrying
+  // it finished. Two framing failures used to end as a complete-looking
+  // response: a body that stopped short of its `Content-Length`, and a chunk
+  // size that did not parse, which was read as the terminating zero chunk. In
+  // both cases a truncated prefix became a valid client registration.
+  //
+  // These drive the production `fetch` against a fixture that writes an exact
+  // sequence of bytes, so the wire is the thing under test. Each malformed
+  // case has its lawful twin beside it: the point is that the refusal comes
+  // from the framing and not from anything the fixtures have in common.
+
+  /** Serve one scripted response on loopback, then close. */
+  private def onTheWire[A](wire: String => String)(use: String => A): A = {
+    val listener = new ServerSocket(0, 1, loopback)
+    val clientId = s"http://localhost:${listener.getLocalPort}/client.json"
+    val t = new Thread(() => {
+      try {
+        val s = listener.accept()
+        try {
+          val in = s.getInputStream
+          var last = ""
+          var c = in.read()
+          while (c >= 0 && !last.endsWith("\r\n\r\n")) {
+            last = (last + c.toChar).takeRight(4)
+            if (!last.endsWith("\r\n\r\n")) c = in.read()
+          }
+          s.getOutputStream.write(wire(clientId).getBytes("UTF-8"))
+          s.getOutputStream.flush()
+        } finally s.close()
+      } catch { case _: Exception => () } finally listener.close()
+    })
+    t.setDaemon(true)
+    t.start()
+    try use(clientId) finally { t.join(3000); listener.close() }
+  }
+
+  // A plain-http client id is refused by `validateClientId` unless the
+  // loopback escape is on, and that refusal happens before anything is
+  // fetched. Without this the malformed cases below would all "refuse"
+  // without a byte reaching the wire — which is how the first version of
+  // these controls passed while proving nothing. The lawful twins are what
+  // exposed it, which is the reason they are here.
+  private def fetchFromWire(wire: String => String) = {
+    val previous = System.getProperty(ClientMetadata.AllowLoopbackProperty)
+    System.setProperty(ClientMetadata.AllowLoopbackProperty, "true")
+    try onTheWire(wire) { id =>
+      ClientMetadata.fetch(mapper, id, allowLoopback = true,
+        resolve = resolvesTo(loopback))
+    } finally {
+      if (previous == null) System.clearProperty(ClientMetadata.AllowLoopbackProperty)
+      else System.setProperty(ClientMetadata.AllowLoopbackProperty, previous)
+    }
+  }
+
+  /**
+   * A refusal that came from reading the message, not from validation.
+   *
+   * Asserting `isLeft` alone cannot tell "the framing was rejected" from
+   * "the request was never made", and those are the two outcomes these cases
+   * exist to separate.
+   */
+  private def refusedByFraming(r: Either[ClientMetadataError, OAuthClient]): Unit =
+    r match {
+      case Left(ClientMetadataError.Unreachable(_)) => ()
+      case other => fail(s"expected a transport-level refusal, got: $other")
+    }
+
+  private def document(id: String) =
+    s"""{"client_id":"$id","client_name":"Wire","redirect_uris":["https://app.example.com/cb"]}"""
+
+  test("a complete Content-Length body is accepted") {
+    val r = fetchFromWire { id =>
+      val b = document(id)
+      s"HTTP/1.1 200 OK\r\nContent-Length: ${b.getBytes("UTF-8").length}\r\nConnection: close\r\n\r\n$b"
+    }
+    withClue(s"$r: ")(r.isRight shouldBe true)
+  }
+
+  test("a body that stops short of its Content-Length is refused") {
+    // The JSON is complete and would parse. The message did not finish.
+    val r = fetchFromWire { id =>
+      val b = document(id)
+      s"HTTP/1.1 200 OK\r\nContent-Length: ${b.getBytes("UTF-8").length + 100}\r\nConnection: close\r\n\r\n$b"
+    }
+    refusedByFraming(r)
+  }
+
+  test("a correctly chunked body is accepted") {
+    val r = fetchFromWire { id =>
+      val b = document(id)
+      val n = b.getBytes("UTF-8").length.toHexString
+      s"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n$n\r\n$b\r\n0\r\n\r\n"
+    }
+    withClue(s"$r: ")(r.isRight shouldBe true)
+  }
+
+  test("a chunk size that does not parse is refused, not read as the last chunk") {
+    val r = fetchFromWire { id =>
+      val b = document(id)
+      val n = b.getBytes("UTF-8").length.toHexString
+      s"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n$n\r\n$b\r\nNOTHEX\r\n"
+    }
+    refusedByFraming(r)
+  }
+
+  test("a chunked body that ends without its terminating chunk is refused") {
+    val r = fetchFromWire { id =>
+      val b = document(id)
+      val n = b.getBytes("UTF-8").length.toHexString
+      s"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n$n\r\n$b\r\n"
+    }
+    refusedByFraming(r)
+  }
+
+  test("a response that is not HTTP at all is refused") {
+    val r = fetchFromWire(_ => "this is not a response\r\n")
+    refusedByFraming(r)
+  }
 }

@@ -118,15 +118,27 @@ resolves the name again, independently, and that second answer decides where
 the request goes. Verifying afterwards is later still, since a response only
 exists once the request has been sent — and sending it is the whole of the
 injury. Neither `HttpURLConnection` nor `java.net.http.HttpClient` can be told
-which address to use, so the socket is opened directly and connected to the
-validated address.
+which address to use. Apache HttpClient can: its `DnsResolver` is consulted
+for the route, so answering with the one address that passed the check is what
+pins the destination.
 
 Pinning the address gives up nothing about authenticating the peer. The socket
-is layered with the original host name and
-`setEndpointIdentificationAlgorithm("HTTPS")`, so the JDK performs its usual
-certificate name check against the name; SNI carries the name too. No proxy is
-consulted, because a proxied request goes wherever the proxy decides and
-destination control would be an illusion.
+factory is the JVM's default HTTPS factory with the default hostname verifier,
+so the usual certificate name check happens against the name; SNI carries the
+name too. No proxy is consulted, because a proxied request goes wherever the
+proxy decides and destination control would be an illusion.
+
+**A document that arrives incompletely is not a document.** The HTTP message
+itself was parsed here once, and the parser was wrong in the two ways a
+hand-written one is prone to: a body that stopped short of its
+`Content-Length` was returned as though it had finished, and a chunk size that
+did not parse was treated as the terminating zero chunk. Both turned a
+truncated prefix into a valid client registration, because a JSON document
+that parses says nothing about whether the message carrying it completed
+(RFC 9112 §6.3, §7.1, §8). Message parsing is now Apache HttpClient's, which
+raises on both — and it is already on GitBucket's runtime classpath, so it is
+`compileOnly` and nothing is bundled. The size limit refuses an oversized
+document rather than returning a prefix of it, for the same reason.
 
 Redirects are refused rather than re-validated because an allowed host
 bouncing to a forbidden one is the usual way such a fence is bypassed, and

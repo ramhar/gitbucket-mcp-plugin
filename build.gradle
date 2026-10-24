@@ -27,6 +27,14 @@ dependencies {
     // so only API present across the tested range is used.
     compileOnly 'com.nimbusds:oauth2-oidc-sdk:11.33'
 
+    // Apache HttpClient parses HTTP messages, including the framing a
+    // hand-written reader got wrong: a body short of its Content-Length and
+    // an unparseable chunk size both have to be errors, not a short string.
+    // GitBucket ships both jars (4.5.14 / 4.4.16 in 4.46.0 through 4.48.0),
+    // so this is compileOnly and nothing is bundled.
+    compileOnly 'org.apache.httpcomponents:httpclient:4.5.14'
+    compileOnly 'org.apache.httpcomponents:httpcore:4.4.16'
+
     testImplementation 'org.scalatest:scalatest_2.13:3.2.18'
     testImplementation 'org.scalatestplus:junit-4-13_2.13:3.2.18.0'
     testRuntimeOnly 'junit:junit:4.13.2'
@@ -35,6 +43,9 @@ dependencies {
     testCompileOnly 'javax.servlet:javax.servlet-api:4.0.1'
     testCompileOnly 'com.nimbusds:oauth2-oidc-sdk:11.33'
     testRuntimeOnly 'com.nimbusds:oauth2-oidc-sdk:11.33'
+    testCompileOnly 'org.apache.httpcomponents:httpclient:4.5.14'
+    testRuntimeOnly 'org.apache.httpcomponents:httpclient:4.5.14'
+    testRuntimeOnly 'org.apache.httpcomponents:httpcore:4.4.16'
     testRuntimeOnly 'io.github.gitbucket:gitbucket_2.13:4.46.0'
     testRuntimeOnly 'javax.servlet:javax.servlet-api:4.0.1'
     testRuntimeOnly 'com.github.takezoe:blocking-slick_2.13:0.0.14'
